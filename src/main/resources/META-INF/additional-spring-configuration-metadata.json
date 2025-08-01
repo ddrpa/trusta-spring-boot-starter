@@ -1,0 +1,64 @@
+{
+  "groups": [
+    {
+      "sourceType": "cc.ddrpa.dorian.trusta.properties.TrustaProperties",
+      "name": "trusta",
+      "type": "cc.ddrpa.dorian.trusta.properties.TrustaProperties"
+    }
+  ],
+  "properties": [
+    {
+      "name": "trusta.private-keyset-file",
+      "type": "java.lang.String",
+      "description": "私钥文件位置，用于签发 JWT",
+      "defaultValue": ".jwt-es256-private-keyset"
+    },
+    {
+      "name": "trusta.issuer",
+      "type": "java.lang.String",
+      "description": "token 签发者，注意 token 接收方默认据此推断公钥位置",
+      "defaultValue": ""
+    },
+    {
+      "name": "trusta.allow-http",
+      "type": "java.lang.Boolean",
+      "description": "允许通过 HTTP 协议获取公钥，不建议在不可控环境中（例如互联网）使用",
+      "defaultValue": false
+    },
+    {
+      "name": "trusta.trusted-issuers",
+      "type": "java.util.List<cc.ddrpa.dorian.trusta.properties.TrustedIssuer>",
+      "description": "受信任的签发者列表"
+    },
+    {
+      "name": "trusta.trusted-issuers[].issuer",
+      "type": "java.lang.String",
+      "description": "token 签发者，example: system-a.site/context/path"
+    },
+    {
+      "name": "trusta.trusted-issuers[].public-key-uri",
+      "type": "java.lang.String",
+      "description": "公钥地址，默认为 https://${issuer}/.well-known/trusta/jwks.json"
+    },
+    {
+      "name": "trusta.trusted-issuers[].expect-audience",
+      "type": "java.lang.Boolean",
+      "description": "是否验证 audience 字段"
+    },
+    {
+      "name": "trusta.trusted-issuers[].custom-audience",
+      "type": "java.lang.String",
+      "description": "默认使用 trusta.issuer 验证 audience 字段，除非通过本属性特别声明"
+    },
+    {
+      "name": "trusta.trusted-issuers[].subject",
+      "type": "java.lang.String",
+      "description": "将 token 中的哪个字段映射到 subject，默认使用 sub 属性，不支持声明 JWT 关键字"
+    },
+    {
+      "name": "trusta.trusted-issuers[].claim-mapping",
+      "type": "java.util.Map<java.lang.String,java.lang.String>",
+      "description": "token 中的字段映射到解析结果"
+    }
+  ]
+}
