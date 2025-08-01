@@ -10,6 +10,9 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 
+/**
+ * Utility for signing JSON Web Tokens (JWT) with custom claims and validity period.
+ */
 public class JsonWebTokenSigner {
     private static final Duration DEFAULT_VALIDITY_PERIOD = Duration.ofMinutes(3);
     private static final String WILDCARD_AUDIENCE = "*";
@@ -22,42 +25,79 @@ public class JsonWebTokenSigner {
     private String subject;
     private String audience;
 
+    /**
+     * Create a new JsonWebTokenSigner.
+     *
+     * @param jwtPublicKeySign the Tink JwtPublicKeySign instance
+     * @param issuer           the issuer string
+     */
     protected JsonWebTokenSigner(JwtPublicKeySign jwtPublicKeySign, String issuer) {
         this.jwtPublicKeySign = jwtPublicKeySign;
         this.issuer = issuer;
     }
 
+    /**
+     * Set the validity period for the token.
+     *
+     * @param validityPeriod the duration the token is valid
+     * @return this
+     */
     public JsonWebTokenSigner setValidityPeriod(Duration validityPeriod) {
         this.validityPeriod = validityPeriod;
         return this;
     }
 
+    /**
+     * Set the subject for the token.
+     *
+     * @param subject the subject
+     * @return this
+     */
     public JsonWebTokenSigner setSubject(String subject) {
         this.subject = subject;
         return this;
     }
 
     /**
-     * 设置哪个系统接收 token
+     * Set the audience for the token.
      *
-     * @param audience
-     * @return
+     * @param audience the audience
+     * @return this
      */
     public JsonWebTokenSigner setAudience(String audience) {
         this.audience = audience;
         return this;
     }
 
+    /**
+     * Add a custom claim to the token.
+     *
+     * @param name  claim name
+     * @param value claim value
+     * @return this
+     */
     public JsonWebTokenSigner addClaim(String name, String value) {
         this.claims.put(name, value);
         return this;
     }
 
+    /**
+     * Add multiple custom claims to the token.
+     *
+     * @param claims map of claims
+     * @return this
+     */
     public JsonWebTokenSigner addClaims(Map<String, String> claims) {
         this.claims.putAll(claims);
         return this;
     }
 
+    /**
+     * Sign and encode the JWT with the configured claims and validity.
+     *
+     * @return the signed JWT as a string
+     * @throws GeneralSecurityException if signing fails
+     */
     public String sign() throws GeneralSecurityException {
         if (Objects.isNull(subject)) {
             throw new IllegalStateException("Subject must be set before signing the JWT");

@@ -26,6 +26,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * Central manager for Trusta JWT operations, including signing and verification.
+ */
 @Component
 public class TrustaManager {
 
@@ -38,6 +41,14 @@ public class TrustaManager {
     private String publicKeySetAsJSONString;
     private JwtPublicKeySign jwtPublicKeySign;
 
+    /**
+     * Construct a TrustaManager with the given properties and object mapper.
+     *
+     * @param trustaProperties Trusta configuration properties
+     * @param objectMapper     Jackson object mapper
+     * @throws GeneralSecurityException if crypto fails
+     * @throws IOException              if key loading fails
+     */
     public TrustaManager(TrustaProperties trustaProperties, ObjectMapper objectMapper) throws GeneralSecurityException, IOException {
         this.trustaProperties = trustaProperties;
         this.issuer = trustaProperties.getIssuer();
@@ -76,7 +87,6 @@ public class TrustaManager {
      * @return
      * @throws GeneralSecurityException
      * @throws IOException
-     * @throws InterruptedException
      */
     public VerifiedClaims verify(String signedToken) throws GeneralSecurityException, IOException {
         // 直接解析确定签发者
@@ -91,6 +101,12 @@ public class TrustaManager {
         }
     }
 
+    /**
+     * Expose the public key set as a JSON response through an HTTP endpoint.
+     *
+     * @param request  the HTTP servlet request
+     * @param response the HTTP servlet response
+     */
     public void exposePublicKeyThroughEndpoint(HttpServletRequest request, HttpServletResponse response) {
         response.setHeader("Content-Type", "application/json");
         response.setCharacterEncoding("UTF-8");
@@ -103,10 +119,21 @@ public class TrustaManager {
         }
     }
 
+    /**
+     * Get a new JWT signer for the current issuer.
+     *
+     * @return a JsonWebTokenSigner instance
+     */
     public JsonWebTokenSigner getSigner() {
         return new JsonWebTokenSigner(this.jwtPublicKeySign, this.issuer);
     }
 
+    /**
+     * Load or generate the private keyset for signing JWTs.
+     *
+     * @throws GeneralSecurityException if cryptographic operations fail
+     * @throws IOException              if file operations fail
+     */
     private void handlePrivateKeysetHandle() throws GeneralSecurityException, IOException {
         KeysetHandle privateKeysetHandle;
         Path privateKeysetPath = Paths.get(trustaProperties.getPrivateKeysetFile());
@@ -134,7 +161,10 @@ public class TrustaManager {
     }
 
     /**
-     * 注册受信任的签发者
+     * Register trusted issuers and initialize their verifiers.
+     * <p>
+     * This method reads the trusted issuers from the configuration, creates a JsonWebTokenVerify
+     * instance for each, and stores them in the verifyMap. It then updates the public keys for all issuers.
      */
     private void registerIssuers() {
         String self = trustaProperties.getIssuer();

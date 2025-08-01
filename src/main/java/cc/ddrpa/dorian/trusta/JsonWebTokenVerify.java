@@ -23,6 +23,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
+/**
+ * Utility for verifying JSON Web Tokens (JWT) and extracting claims.
+ */
 public class JsonWebTokenVerify {
 
     private static final List<String> CLAIM_KEYWORDS = List.of("iss", "sub", "aud", "exp", "nbf", "iat", "jti");
@@ -44,6 +47,13 @@ public class JsonWebTokenVerify {
 
     private JwtPublicKeyVerify jwtPublicKeyVerify;
 
+    /**
+     * Construct a new JsonWebTokenVerify instance.
+     *
+     * @param issuer                         TrustedIssuer configuration
+     * @param self                           self identifier
+     * @param allowFetchPublicKeyThroughHTTP allow HTTP fetch for public key
+     */
     public JsonWebTokenVerify(TrustedIssuer issuer, String self, boolean allowFetchPublicKeyThroughHTTP) {
         String issuerName = issuer.getIssuer();
         this.issuer = issuerName;
