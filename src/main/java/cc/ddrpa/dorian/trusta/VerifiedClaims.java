@@ -1,16 +1,12 @@
 package cc.ddrpa.dorian.trusta;
 
-import lombok.Data;
-import lombok.EqualsAndHashCode;
-
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Holds verified claims extracted from a JWT.
  */
-@Data
-@EqualsAndHashCode(callSuper = false)
 public class VerifiedClaims {
     /**
      * The subject of the JWT.
@@ -24,6 +20,31 @@ public class VerifiedClaims {
      * The raw payload of the JWT.
      */
     private String rawPayload;
+
+    public String getSubject() {
+        return subject;
+    }
+
+    public void setSubject(String subject) {
+        this.subject = subject;
+    }
+
+    public Map<String, Object> getClaims() {
+        return claims;
+    }
+
+    public void setClaims(Map<String, Object> claims) {
+        this.claims = claims;
+    }
+
+    public String getRawPayload() {
+        return rawPayload;
+    }
+
+    public VerifiedClaims setRawPayload(String rawPayload) {
+        this.rawPayload = rawPayload;
+        return this;
+    }
 
     /**
      * Add a claim to the claims map.
@@ -45,14 +66,27 @@ public class VerifiedClaims {
         return claims.get(claim);
     }
 
-    /**
-     * Set the raw payload string.
-     *
-     * @param rawPayload the raw JWT payload
-     * @return this
-     */
-    public VerifiedClaims setRawPayload(String rawPayload) {
-        this.rawPayload = rawPayload;
-        return this;
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        VerifiedClaims that = (VerifiedClaims) o;
+        return Objects.equals(subject, that.subject) &&
+                Objects.equals(claims, that.claims) &&
+                Objects.equals(rawPayload, that.rawPayload);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(subject, claims, rawPayload);
+    }
+
+    @Override
+    public String toString() {
+        return "VerifiedClaims{" +
+                "subject='" + subject + '\'' +
+                ", claims=" + claims +
+                ", rawPayload='" + rawPayload + '\'' +
+                '}';
     }
 }
