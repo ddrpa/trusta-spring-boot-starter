@@ -8,7 +8,6 @@ import com.google.crypto.tink.TinkJsonProtoKeysetFormat;
 import com.google.crypto.tink.jwt.JwtPublicKeyVerify;
 import com.google.crypto.tink.jwt.JwtValidator;
 import com.google.crypto.tink.jwt.VerifiedJwt;
-import lombok.Getter;
 import org.springframework.util.StringUtils;
 
 import java.io.IOException;
@@ -31,7 +30,6 @@ public class JsonWebTokenVerify {
     private static final List<String> CLAIM_KEYWORDS = List.of("iss", "sub", "aud", "exp", "nbf", "iat", "jti");
     private static final String CLAIM_SUBJECT = "sub";
 
-    @Getter
     private final String issuer;
     private final URI publicKeyURI;
     private final boolean requireCustomSubject;
@@ -40,9 +38,7 @@ public class JsonWebTokenVerify {
     private final Map<String, String> claimMapping;
     private final JwtValidator jwtValidator;
 
-    @Getter
     private LocalDateTime lastUpdateTime = LocalDateTime.now();
-    @Getter
     private boolean ready = false;
 
     private JwtPublicKeyVerify jwtPublicKeyVerify;
@@ -101,6 +97,18 @@ public class JsonWebTokenVerify {
         // 其他 claim 映射
         this.claimMapping = issuer.getClaimMapping();
         this.requireAdditionalClaims = !this.claimMapping.isEmpty();
+    }
+
+    public String getIssuer() {
+        return issuer;
+    }
+
+    public LocalDateTime getLastUpdateTime() {
+        return lastUpdateTime;
+    }
+
+    public boolean isReady() {
+        return ready;
     }
 
     /**
