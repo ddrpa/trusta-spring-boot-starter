@@ -1,6 +1,8 @@
 package cc.ddrpa.dorian.trusta;
 
 import cc.ddrpa.dorian.trusta.properties.TrustedIssuer;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.crypto.tink.InsecureSecretKeyAccess;
 import com.google.crypto.tink.KeysetHandle;
 import com.google.crypto.tink.RegistryConfiguration;
@@ -8,6 +10,8 @@ import com.google.crypto.tink.TinkJsonProtoKeysetFormat;
 import com.google.crypto.tink.jwt.JwtPublicKeyVerify;
 import com.google.crypto.tink.jwt.JwtValidator;
 import com.google.crypto.tink.jwt.VerifiedJwt;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.util.StringUtils;
 
 import java.io.IOException;
@@ -15,170 +19,242 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.time.Duration;
-import java.time.LocalDateTime;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
+import java.time.Instant;
+import java.util.Base64;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
 /**
- * Utility for verifying JSON Web Tokens (JWT) and extracting claims.
+ * Verifies JWTs from a single trusted issuer.
+ * <p>
+ * Always validates {@code iss} and {@code aud}. Public keys are cached in memory and
+ * refreshed on demand when the cache is empty/expired or the token {@code kid} is unknown.
  */
 public class JsonWebTokenVerify {
 
-    private static final List<String> CLAIM_KEYWORDS = List.of("iss", "sub", "aud", "exp", "nbf", "iat", "jti");
-    private static final String CLAIM_SUBJECT = "sub";
+    private static final Logger logger = LoggerFactory.getLogger(JsonWebTokenVerify.class);
+    static final Duration DEFAULT_PUBLIC_KEY_CACHE_TTL = Duration.ofMinutes(3);
+    private static final String DEFAULT_JWKS_PATH = "/.well-known/trusta-jwks.json";
 
     private final String issuer;
     private final URI publicKeyURI;
-    private final boolean requireCustomSubject;
-    private final String subjectClaimName;
-    private final boolean requireAdditionalClaims;
-    private final Map<String, String> claimMapping;
     private final JwtValidator jwtValidator;
+    private final ObjectMapper objectMapper;
+    private final Duration cacheTtl;
+    private final HttpClient httpClient = HttpClient.newHttpClient();
 
-    private LocalDateTime lastUpdateTime = LocalDateTime.now();
-    private boolean ready = false;
-
-    private JwtPublicKeyVerify jwtPublicKeyVerify;
+    private final Object lock = new Object();
+    private volatile JwtPublicKeyVerify jwtPublicKeyVerify;
+    private volatile Set<String> knownKids = Collections.emptySet();
+    private volatile Instant cacheExpiresAt = Instant.EPOCH;
+    private volatile Instant lastUpdateTime;
+    private volatile CompletableFuture<Void> inFlightRefresh;
 
     /**
-     * Construct a new JsonWebTokenVerify instance.
-     *
-     * @param issuer                         TrustedIssuer configuration
-     * @param self                           self identifier
-     * @param allowFetchPublicKeyThroughHTTP allow HTTP fetch for public key
+     * @param issuer                         trusted issuer configuration
+     * @param self                           this system's issuer (expected audience)
+     * @param allowFetchPublicKeyThroughHTTP whether HTTP (non-TLS) JWKS URIs are allowed
+     * @param objectMapper                   JSON mapper for JWT header/keyset parsing
      */
-    public JsonWebTokenVerify(TrustedIssuer issuer, String self, boolean allowFetchPublicKeyThroughHTTP) {
+    public JsonWebTokenVerify(TrustedIssuer issuer, String self, boolean allowFetchPublicKeyThroughHTTP,
+                              ObjectMapper objectMapper) {
+        this(issuer, self, allowFetchPublicKeyThroughHTTP, objectMapper, DEFAULT_PUBLIC_KEY_CACHE_TTL);
+    }
+
+    JsonWebTokenVerify(TrustedIssuer issuer, String self, boolean allowFetchPublicKeyThroughHTTP,
+                       ObjectMapper objectMapper, Duration cacheTtl) {
         String issuerName = issuer.getIssuer();
+        if (!StringUtils.hasText(issuerName)) {
+            throw new IllegalArgumentException("trusted issuer name must not be blank");
+        }
+        if (!StringUtils.hasText(self)) {
+            throw new IllegalArgumentException("trusta.issuer (self / expected audience) must not be blank");
+        }
         this.issuer = issuerName;
+        this.objectMapper = objectMapper;
+        this.cacheTtl = cacheTtl;
         if (StringUtils.hasText(issuer.getPublicKeyUri())) {
             URI uri = URI.create(issuer.getPublicKeyUri());
-            if (!allowFetchPublicKeyThroughHTTP && uri.getScheme().equals("http")) {
-                throw new IllegalArgumentException("HTTP URI scheme is not allowed");
-            } else {
-                this.publicKeyURI = uri;
+            if (!allowFetchPublicKeyThroughHTTP && "http".equalsIgnoreCase(uri.getScheme())) {
+                throw new IllegalArgumentException("HTTP URI scheme is not allowed for issuer: " + issuerName);
             }
+            this.publicKeyURI = uri;
         } else {
-            this.publicKeyURI = URI.create("https://" + issuerName + "/.well-known/trusta/jwks.json");
+            this.publicKeyURI = URI.create("https://" + issuerName + DEFAULT_JWKS_PATH);
         }
-        String audience;
-        if (StringUtils.hasText(issuer.getCustomAudience())) {
-            audience = issuer.getCustomAudience();
-        } else {
-            audience = self;
-        }
-        boolean expectAudience = issuer.isExpectAudience();
-        JwtValidator.Builder builder = JwtValidator.newBuilder()
-                .expectIssuer(issuerName);
-        if (expectAudience) {
-            builder.expectAudience(audience);
-        } else {
-            builder.ignoreAudiences();
-        }
-        this.jwtValidator = builder.build();
-        // subject 映射
-        if (StringUtils.hasText(issuer.getSubject())) {
-            if (CLAIM_SUBJECT.equals(issuer.getSubject())) {
-                this.requireCustomSubject = false;
-                this.subjectClaimName = "sub";
-            } else if (CLAIM_KEYWORDS.contains(issuer.getSubject())) {
-                throw new IllegalArgumentException("Using keyword is not allowed");
-            } else {
-                this.requireCustomSubject = true;
-                this.subjectClaimName = issuer.getSubject();
-            }
-        } else {
-            // 默认使用 sub 字段
-            this.requireCustomSubject = false;
-            this.subjectClaimName = "sub";
-        }
-        // 其他 claim 映射
-        this.claimMapping = issuer.getClaimMapping();
-        this.requireAdditionalClaims = !this.claimMapping.isEmpty();
+        this.jwtValidator = JwtValidator.newBuilder()
+                .expectIssuer(issuerName)
+                .expectAudience(self)
+                .build();
     }
 
     public String getIssuer() {
         return issuer;
     }
 
-    public LocalDateTime getLastUpdateTime() {
+    public Instant getLastUpdateTime() {
         return lastUpdateTime;
     }
 
     public boolean isReady() {
-        return ready;
+        return jwtPublicKeyVerify != null;
     }
 
     /**
-     * 验证并解析给定的 JWT
-     *
-     * @param signedToken
-     * @return
-     * @throws GeneralSecurityException
+     * Verify and decode a JWT from this issuer.
      */
     public VerifiedClaims verify(final String signedToken) throws GeneralSecurityException {
-        if (!this.ready) {
-            throw new IllegalStateException("Public key is not ready, please try updatePublicKey() again");
+        ensurePublicKey(signedToken);
+        JwtPublicKeyVerify verifier = this.jwtPublicKeyVerify;
+        if (verifier == null) {
+            throw new IllegalStateException("Public key is not ready for issuer: " + issuer);
         }
-
-        VerifiedJwt verifiedJwt = jwtPublicKeyVerify.verifyAndDecode(signedToken, this.jwtValidator);
-        VerifiedClaims verifiedClaims = new VerifiedClaims();
-        if (this.requireCustomSubject) {
-            verifiedClaims.setSubject(verifiedJwt.getStringClaim(this.subjectClaimName));
-        } else {
-            verifiedClaims.setSubject(verifiedJwt.getSubject());
-        }
-        if (this.requireAdditionalClaims) {
-            for (Map.Entry<String, String> entry : this.claimMapping.entrySet()) {
-                String entryKey = entry.getKey();
-                String mappedKey = entry.getValue();
-                switch (entryKey) {
-                    case "iss" -> verifiedClaims.addClaim(mappedKey, verifiedJwt.getIssuer());
-                    case "sub" -> verifiedClaims.addClaim(mappedKey, verifiedJwt.getSubject());
-                    case "aud" -> verifiedClaims.addClaim(mappedKey, verifiedJwt.getAudiences());
-                    case "exp" -> verifiedClaims.addClaim(mappedKey, verifiedJwt.getExpiration());
-                    case "nbf" -> verifiedClaims.addClaim(mappedKey, verifiedJwt.getNotBefore());
-                    case "iat" -> verifiedClaims.addClaim(mappedKey, verifiedJwt.getIssuedAt());
-                    case "jti" -> verifiedClaims.addClaim(mappedKey, verifiedJwt.getJwtId());
-                    default -> {
-                        String claimValue = verifiedJwt.getStringClaim(entryKey);
-                        if (Objects.nonNull(claimValue)) {
-                            verifiedClaims.addClaim(mappedKey, claimValue);
-                        }
-                    }
+        try {
+            return decode(verifier, signedToken);
+        } catch (GeneralSecurityException firstFailure) {
+            String kid = extractKid(signedToken);
+            if (kid != null && !knownKids.contains(kid)) {
+                forceRefresh();
+                verifier = this.jwtPublicKeyVerify;
+                if (verifier == null) {
+                    throw firstFailure;
                 }
+                return decode(verifier, signedToken);
             }
+            throw firstFailure;
         }
-        return verifiedClaims;
+    }
+
+    private VerifiedClaims decode(JwtPublicKeyVerify verifier, String signedToken) throws GeneralSecurityException {
+        VerifiedJwt verifiedJwt = verifier.verifyAndDecode(signedToken, this.jwtValidator);
+        return new VerifiedClaims()
+                .setIssuer(verifiedJwt.getIssuer())
+                .setSubject(verifiedJwt.getSubject());
     }
 
     /**
-     * 更新对端公钥集
-     *
-     * @throws GeneralSecurityException
-     * @throws IOException
-     * @throws InterruptedException
+     * Force-refresh the public keyset from the configured URI.
      */
     public void updatePublicKey() throws GeneralSecurityException, IOException, InterruptedException {
-        HttpClient httpClient = HttpClient.newHttpClient();
+        forceRefresh();
+    }
+
+    private void ensurePublicKey(String signedToken) throws GeneralSecurityException {
+        String kid = extractKid(signedToken);
+        Instant now = Instant.now();
+        if (jwtPublicKeyVerify != null
+                && now.isBefore(cacheExpiresAt)
+                && (kid == null || knownKids.contains(kid))) {
+            return;
+        }
+        forceRefresh();
+    }
+
+    private void forceRefresh() throws GeneralSecurityException {
+        CompletableFuture<Void> refresh;
+        synchronized (lock) {
+            if (inFlightRefresh != null) {
+                refresh = inFlightRefresh;
+            } else {
+                refresh = CompletableFuture.runAsync(() -> {
+                    try {
+                        fetchAndApplyPublicKey();
+                    } catch (Exception e) {
+                        throw new CompletionException(e);
+                    }
+                });
+                inFlightRefresh = refresh;
+                refresh.whenComplete((ok, err) -> {
+                    synchronized (lock) {
+                        if (inFlightRefresh == refresh) {
+                            inFlightRefresh = null;
+                        }
+                    }
+                });
+            }
+        }
+        try {
+            refresh.join();
+        } catch (CompletionException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            if (jwtPublicKeyVerify != null) {
+                logger.warn("Failed to refresh public key for issuer {}, keeping cached keyset: {}",
+                        issuer, cause.getMessage());
+                return;
+            }
+            if (cause instanceof GeneralSecurityException gse) {
+                throw gse;
+            }
+            if (cause instanceof IOException ioe) {
+                throw new GeneralSecurityException("Failed to fetch public key for issuer: " + issuer, ioe);
+            }
+            if (cause instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+                throw new GeneralSecurityException("Interrupted while fetching public key for issuer: " + issuer, cause);
+            }
+            throw new GeneralSecurityException("Failed to fetch public key for issuer: " + issuer, cause);
+        }
+    }
+
+    private void fetchAndApplyPublicKey() throws GeneralSecurityException, IOException, InterruptedException {
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(publicKeyURI)
                 .timeout(Duration.ofSeconds(10))
+                .GET()
                 .build();
-        HttpResponse<String> response = httpClient.send(request,
-                HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
         if (response.statusCode() != 200) {
             throw new IOException("Failed to fetch public keyset from " + publicKeyURI
                     + ", status code: " + response.statusCode());
         }
         String publicKeysetAsString = response.body();
-        // 将 JWK Set 转换为 PublicKeysetHandle
-        KeysetHandle publicKeysetHandle = TinkJsonProtoKeysetFormat.parseKeyset(publicKeysetAsString, InsecureSecretKeyAccess.get());
+        KeysetHandle publicKeysetHandle = TinkJsonProtoKeysetFormat.parseKeyset(
+                publicKeysetAsString, InsecureSecretKeyAccess.get());
+        JwtPublicKeyVerify verify = publicKeysetHandle.getPrimitive(
+                RegistryConfiguration.get(), JwtPublicKeyVerify.class);
+        Set<String> kids = extractKidsFromKeyset(publicKeysetHandle);
+        synchronized (lock) {
+            this.jwtPublicKeyVerify = verify;
+            this.knownKids = kids;
+            this.lastUpdateTime = Instant.now();
+            this.cacheExpiresAt = this.lastUpdateTime.plus(cacheTtl);
+        }
+    }
 
-        this.jwtPublicKeyVerify = publicKeysetHandle.getPrimitive(RegistryConfiguration.get(), JwtPublicKeyVerify.class);
-        this.lastUpdateTime = LocalDateTime.now();
-        this.ready = true;
+    static Set<String> extractKidsFromKeyset(KeysetHandle publicKeysetHandle) {
+        Set<String> kids = new HashSet<>();
+        for (int i = 0; i < publicKeysetHandle.size(); i++) {
+            KeysetHandle.Entry entry = publicKeysetHandle.getAt(i);
+            if (entry.getStatus() == com.google.crypto.tink.KeyStatus.ENABLED) {
+                kids.add(base64UrlKid(entry.getId()));
+            }
+        }
+        return Collections.unmodifiableSet(kids);
+    }
+
+    static String base64UrlKid(int keyId) {
+        byte[] bigEndianKeyId = ByteBuffer.allocate(4).putInt(keyId).array();
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bigEndianKeyId);
+    }
+
+    String extractKid(String signedToken) {
+        try {
+            String[] parts = signedToken.split("\\.");
+            if (parts.length < 2) {
+                return null;
+            }
+            String headerJson = new String(Base64.getUrlDecoder().decode(parts[0]), StandardCharsets.UTF_8);
+            JsonNode kidNode = objectMapper.readTree(headerJson).get("kid");
+            return kidNode == null || kidNode.isNull() ? null : kidNode.asText();
+        } catch (Exception e) {
+            return null;
+        }
     }
 }

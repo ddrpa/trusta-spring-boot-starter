@@ -1,32 +1,34 @@
 package cc.ddrpa.dorian.trusta.properties;
 
-import java.util.Collections;
-import java.util.Map;
+import cc.ddrpa.dorian.trusta.SubjectStrategy;
+
 import java.util.Objects;
 
+/**
+ * A trusted token issuer that this system accepts tokens from.
+ */
 public class TrustedIssuer {
-    // token 签发者，example: system-a.site/context/path
+    /**
+     * Token issuer, e.g. {@code system-a.site}.
+     */
     private String issuer;
-    // 公钥地址，默认为 https://${issuer}/.well-known/trusta/jwks.json
+    /**
+     * Public key URI; defaults to {@code https://${issuer}/.well-known/trusta-jwks.json}.
+     */
     private String publicKeyUri;
-    // 是否验证 audience 字段
-    private boolean expectAudience;
-    // 若需要验证 audience 字段，则使用 issuer，但有该字段时覆盖
-    private String customAudience;
-    // subject 字段映射，不支持 JWT 关键字，未配置或配置错误时回落到使用 sub 字段
-    private String subject;
-    private Map<String, String> claimMapping = Collections.emptyMap();
+    /**
+     * {@link SubjectStrategy} implementation class used to match {@code sub} to a local user.
+     * Multiple issuers may share the same class.
+     */
+    private Class<? extends SubjectStrategy> identifier;
 
     public TrustedIssuer() {
     }
 
-    public TrustedIssuer(String issuer, String publicKeyUri, boolean expectAudience, String customAudience, String subject, Map<String, String> claimMapping) {
+    public TrustedIssuer(String issuer, String publicKeyUri, Class<? extends SubjectStrategy> identifier) {
         this.issuer = issuer;
         this.publicKeyUri = publicKeyUri;
-        this.expectAudience = expectAudience;
-        this.customAudience = customAudience;
-        this.subject = subject;
-        this.claimMapping = claimMapping;
+        this.identifier = identifier;
     }
 
     public String getIssuer() {
@@ -47,39 +49,12 @@ public class TrustedIssuer {
         return this;
     }
 
-    public boolean isExpectAudience() {
-        return expectAudience;
+    public Class<? extends SubjectStrategy> getIdentifier() {
+        return identifier;
     }
 
-    public TrustedIssuer setExpectAudience(boolean expectAudience) {
-        this.expectAudience = expectAudience;
-        return this;
-    }
-
-    public String getCustomAudience() {
-        return customAudience;
-    }
-
-    public TrustedIssuer setCustomAudience(String customAudience) {
-        this.customAudience = customAudience;
-        return this;
-    }
-
-    public String getSubject() {
-        return subject;
-    }
-
-    public TrustedIssuer setSubject(String subject) {
-        this.subject = subject;
-        return this;
-    }
-
-    public Map<String, String> getClaimMapping() {
-        return claimMapping;
-    }
-
-    public TrustedIssuer setClaimMapping(Map<String, String> claimMapping) {
-        this.claimMapping = claimMapping;
+    public TrustedIssuer setIdentifier(Class<? extends SubjectStrategy> identifier) {
+        this.identifier = identifier;
         return this;
     }
 
@@ -88,17 +63,14 @@ public class TrustedIssuer {
         if (this == o) return true;
         if (o == null || getClass() != o.getClass()) return false;
         TrustedIssuer that = (TrustedIssuer) o;
-        return expectAudience == that.expectAudience &&
-                Objects.equals(issuer, that.issuer) &&
+        return Objects.equals(issuer, that.issuer) &&
                 Objects.equals(publicKeyUri, that.publicKeyUri) &&
-                Objects.equals(customAudience, that.customAudience) &&
-                Objects.equals(subject, that.subject) &&
-                Objects.equals(claimMapping, that.claimMapping);
+                Objects.equals(identifier, that.identifier);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(issuer, publicKeyUri, expectAudience, customAudience, subject, claimMapping);
+        return Objects.hash(issuer, publicKeyUri, identifier);
     }
 
     @Override
@@ -106,10 +78,7 @@ public class TrustedIssuer {
         return "TrustedIssuer{" +
                 "issuer='" + issuer + '\'' +
                 ", publicKeyUri='" + publicKeyUri + '\'' +
-                ", expectAudience=" + expectAudience +
-                ", customAudience='" + customAudience + '\'' +
-                ", subject='" + subject + '\'' +
-                ", claimMapping=" + claimMapping +
+                ", identifier=" + identifier +
                 '}';
     }
 }

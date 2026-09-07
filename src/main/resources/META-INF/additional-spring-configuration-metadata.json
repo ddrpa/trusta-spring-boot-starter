@@ -16,7 +16,7 @@
     {
       "name": "trusta.issuer",
       "type": "java.lang.String",
-      "description": "token 签发者，注意 token 接收方默认据此推断公钥位置",
+      "description": "本系统 token 签发者标识；接收方校验 aud 时也使用该值；对端未配置 public-key-uri 时据此推断 https://${issuer}/.well-known/trusta-jwks.json",
       "defaultValue": ""
     },
     {
@@ -33,32 +33,17 @@
     {
       "name": "trusta.trusted-issuers[].issuer",
       "type": "java.lang.String",
-      "description": "token 签发者，example: system-a.site/context/path"
+      "description": "token 签发者，example: system-a.example.cc"
     },
     {
       "name": "trusta.trusted-issuers[].public-key-uri",
       "type": "java.lang.String",
-      "description": "公钥地址，默认为 https://${issuer}/.well-known/trusta/jwks.json"
+      "description": "公钥地址，默认为 https://${issuer}/.well-known/trusta-jwks.json"
     },
     {
-      "name": "trusta.trusted-issuers[].expect-audience",
-      "type": "java.lang.Boolean",
-      "description": "是否验证 audience 字段"
-    },
-    {
-      "name": "trusta.trusted-issuers[].custom-audience",
-      "type": "java.lang.String",
-      "description": "默认使用 trusta.issuer 验证 audience 字段，除非通过本属性特别声明"
-    },
-    {
-      "name": "trusta.trusted-issuers[].subject",
-      "type": "java.lang.String",
-      "description": "将 token 中的哪个字段映射到 subject，默认使用 sub 属性，不支持声明 JWT 关键字"
-    },
-    {
-      "name": "trusta.trusted-issuers[].claim-mapping",
-      "type": "java.util.Map<java.lang.String,java.lang.String>",
-      "description": "token 中的字段映射到解析结果"
+      "name": "trusta.trusted-issuers[].identifier",
+      "type": "java.lang.Class",
+      "description": "SubjectStrategy 实现类；多个 issuer 可指向同一 Class 以复用用户匹配与静默注册逻辑"
     }
   ]
 }

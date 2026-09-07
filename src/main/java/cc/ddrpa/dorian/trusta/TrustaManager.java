@@ -4,6 +4,7 @@ import cc.ddrpa.dorian.trusta.properties.TrustaProperties;
 import cc.ddrpa.dorian.trusta.properties.TrustedIssuer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.crypto.tink.InsecureSecretKeyAccess;
+import com.google.crypto.tink.KeyStatus;
 import com.google.crypto.tink.KeysetHandle;
 import com.google.crypto.tink.RegistryConfiguration;
 import com.google.crypto.tink.TinkJsonProtoKeysetFormat;
@@ -13,7 +14,8 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.stereotype.Component;
+import org.springframework.context.ApplicationContext;
+import org.springframework.util.StringUtils;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -25,41 +27,63 @@ import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
- * Central manager for Trusta JWT operations, including signing and verification.
+ * Central manager for Trusta JWT operations: signing, verification, key rotation,
+ * and subject resolution via {@link SubjectStrategy}.
  */
-@Component
 public class TrustaManager {
 
+    public static final String JWKS_PATH = "/.well-known/trusta-jwks.json";
+
     private static final Logger logger = LoggerFactory.getLogger(TrustaManager.class);
+
     private final TrustaProperties trustaProperties;
     private final ObjectMapper objectMapper;
+    private final ApplicationContext applicationContext;
     private final String issuer;
+    private final Path privateKeysetPath;
 
     private final Map<String, JsonWebTokenVerify> verifyMap = new HashMap<>();
-    private String publicKeySetAsJSONString;
-    private JwtPublicKeySign jwtPublicKeySign;
+    private final Map<String, SubjectStrategy<?>> strategyMap = new HashMap<>();
 
-    /**
-     * Construct a TrustaManager with the given properties and object mapper.
-     *
-     * @param trustaProperties Trusta configuration properties
-     * @param objectMapper     Jackson object mapper
-     * @throws GeneralSecurityException if crypto fails
-     * @throws IOException              if key loading fails
-     */
-    public TrustaManager(TrustaProperties trustaProperties, ObjectMapper objectMapper) throws GeneralSecurityException, IOException {
+    private volatile KeysetHandle privateKeysetHandle;
+    private volatile String publicKeySetAsJSONString;
+    private volatile JwtPublicKeySign jwtPublicKeySign;
+    private volatile boolean strategiesBound;
+
+    public TrustaManager(TrustaProperties trustaProperties, ObjectMapper objectMapper,
+                         ApplicationContext applicationContext) throws GeneralSecurityException, IOException {
         this.trustaProperties = trustaProperties;
-        this.issuer = trustaProperties.getIssuer();
         this.objectMapper = objectMapper;
+        this.applicationContext = applicationContext;
+        this.issuer = trustaProperties.getIssuer();
+        this.privateKeysetPath = Paths.get(trustaProperties.getPrivateKeysetFile());
 
         handlePrivateKeysetHandle();
         registerIssuers();
     }
 
     /**
-     * 更新对端签发者公钥
+     * Create a signer targeted at a specific audience. Audience is required.
+     */
+    public JsonWebTokenSigner issueTo(String audience) {
+        if (!StringUtils.hasText(audience)) {
+            throw new IllegalArgumentException("audience must not be blank");
+        }
+        return new JsonWebTokenSigner(this.jwtPublicKeySign, this.issuer).setAudience(audience);
+    }
+
+    /**
+     * Get a new JWT signer for the current issuer. Audience must still be set before {@code sign()}.
+     */
+    public JsonWebTokenSigner getSigner() {
+        return new JsonWebTokenSigner(this.jwtPublicKeySign, this.issuer);
+    }
+
+    /**
+     * Manually refresh cached public keys for all trusted issuers.
      */
     public void updateIssuerPublicKey() {
         logger.info("Updating issuer public keys");
@@ -81,31 +105,147 @@ public class TrustaManager {
     }
 
     /**
-     * 验证和解析 JWT
-     *
-     * @param signedToken
-     * @return
-     * @throws GeneralSecurityException
-     * @throws IOException
+     * Verify and parse a JWT from a trusted issuer.
      */
     public VerifiedClaims verify(String signedToken) throws GeneralSecurityException, IOException {
-        // 直接解析确定签发者
         String[] parts = signedToken.split("\\.");
-        if (parts.length != 3) throw new IllegalArgumentException("Invalid JWT format");
+        if (parts.length != 3) {
+            throw new IllegalArgumentException("Invalid JWT format");
+        }
         String payloadJson = new String(Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8);
         String claimedIssuer = objectMapper.readTree(payloadJson).path("iss").asText();
-        if (verifyMap.containsKey(claimedIssuer)) {
-            return verifyMap.get(claimedIssuer).verify(signedToken).setRawPayload(payloadJson);
-        } else {
+        JsonWebTokenVerify verifier = verifyMap.get(claimedIssuer);
+        if (verifier == null) {
             throw new GeneralSecurityException("Unknown issuer: " + claimedIssuer);
         }
+        return verifier.verify(signedToken).setRawPayload(payloadJson);
+    }
+
+    /**
+     * Verify a token and resolve it to a local user through the issuer's {@link SubjectStrategy}.
+     */
+    @SuppressWarnings("unchecked")
+    public <T> T resolve(String signedToken) throws GeneralSecurityException, IOException {
+        ensureStrategiesBound();
+        VerifiedClaims claims = verify(signedToken);
+        SubjectStrategy<T> strategy = (SubjectStrategy<T>) strategyMap.get(claims.getIssuer());
+        if (strategy == null) {
+            throw new IllegalStateException("No SubjectStrategy bound for issuer: " + claims.getIssuer());
+        }
+        Optional<T> found = strategy.find(claims.getSubject(), claims);
+        return found.orElseGet(() -> strategy.register(claims.getSubject(), claims));
+    }
+
+    /**
+     * Bind {@link SubjectStrategy} beans declared by {@code trusted-issuers[].identifier}.
+     * Must run after the application context has finished creating user beans.
+     */
+    public synchronized void bindSubjectStrategies() {
+        if (strategiesBound) {
+            return;
+        }
+        Map<Class<?>, SubjectStrategy<?>> beanByClass = new HashMap<>();
+        for (TrustedIssuer trustedIssuer : trustaProperties.getTrustedIssuers()) {
+            Class<? extends SubjectStrategy> identifier = trustedIssuer.getIdentifier();
+            if (identifier == null) {
+                throw new IllegalStateException(
+                        "trusted-issuers[].identifier is required for issuer: " + trustedIssuer.getIssuer());
+            }
+            if (!SubjectStrategy.class.isAssignableFrom(identifier)) {
+                throw new IllegalStateException(
+                        "identifier must implement SubjectStrategy for issuer: " + trustedIssuer.getIssuer()
+                                + ", got: " + identifier.getName());
+            }
+            SubjectStrategy<?> strategy = beanByClass.get(identifier);
+            if (strategy == null) {
+                try {
+                    strategy = applicationContext.getBean(identifier);
+                } catch (Exception e) {
+                    throw new IllegalStateException(
+                            "No Spring bean of type " + identifier.getName()
+                                    + " for issuer " + trustedIssuer.getIssuer()
+                                    + ". Register it with @Component or @Bean.", e);
+                }
+                beanByClass.put(identifier, strategy);
+            }
+            strategyMap.put(trustedIssuer.getIssuer(), strategy);
+        }
+        strategiesBound = true;
+        logger.info("Bound {} subject strategies for {} trusted issuers",
+                beanByClass.size(), strategyMap.size());
+    }
+
+    /**
+     * Rotate the signing key: add a new ES256 primary key with kid, persist, refresh JWKS.
+     *
+     * @return the new primary key id
+     */
+    public synchronized int rotateSigningKey() throws GeneralSecurityException, IOException {
+        JwtEcdsaParameters parameters = jwtEcdsaParameters();
+        KeysetHandle.Builder builder = KeysetHandle.newBuilder(privateKeysetHandle);
+        builder.addEntry(KeysetHandle.generateEntryFromParameters(parameters).withRandomId().makePrimary());
+        applyKeyset(builder.build());
+        int primaryId = privateKeysetHandle.getPrimary().getId();
+        logger.info("Rotated signing key, new primary key id={}", primaryId);
+        return primaryId;
+    }
+
+    /**
+     * Disable a non-primary signing key by Tink key id.
+     */
+    public synchronized void disableSigningKey(int keyId) throws GeneralSecurityException, IOException {
+        if (privateKeysetHandle.getPrimary().getId() == keyId) {
+            throw new IllegalArgumentException("Cannot disable the primary signing key id=" + keyId);
+        }
+        KeysetHandle.Builder fresh = KeysetHandle.newBuilder();
+        boolean found = false;
+        for (int i = 0; i < privateKeysetHandle.size(); i++) {
+            KeysetHandle.Entry entry = privateKeysetHandle.getAt(i);
+            KeysetHandle.Builder.Entry imported = KeysetHandle.importKey(entry.getKey()).withFixedId(entry.getId());
+            if (entry.getId() == keyId) {
+                imported.setStatus(KeyStatus.DISABLED);
+                found = true;
+            } else {
+                imported.setStatus(entry.getStatus());
+            }
+            if (entry.isPrimary()) {
+                imported.makePrimary();
+            }
+            fresh.addEntry(imported);
+        }
+        if (!found) {
+            throw new IllegalArgumentException("Unknown signing key id=" + keyId);
+        }
+        applyKeyset(fresh.build());
+        logger.info("Disabled signing key id={}", keyId);
+    }
+
+    /**
+     * Disable all non-primary keys after a rotation grace period.
+     */
+    public synchronized void disableNonPrimaryKeys() throws GeneralSecurityException, IOException {
+        int primaryId = privateKeysetHandle.getPrimary().getId();
+        KeysetHandle.Builder fresh = KeysetHandle.newBuilder();
+        int disabled = 0;
+        for (int i = 0; i < privateKeysetHandle.size(); i++) {
+            KeysetHandle.Entry entry = privateKeysetHandle.getAt(i);
+            KeysetHandle.Builder.Entry imported = KeysetHandle.importKey(entry.getKey()).withFixedId(entry.getId());
+            if (entry.getId() == primaryId) {
+                imported.setStatus(KeyStatus.ENABLED).makePrimary();
+            } else if (entry.getStatus() == KeyStatus.ENABLED) {
+                imported.setStatus(KeyStatus.DISABLED);
+                disabled++;
+            } else {
+                imported.setStatus(entry.getStatus());
+            }
+            fresh.addEntry(imported);
+        }
+        applyKeyset(fresh.build());
+        logger.info("Disabled {} non-primary signing keys; primary id={}", disabled, primaryId);
     }
 
     /**
      * Expose the public key set as a JSON response through an HTTP endpoint.
-     *
-     * @param request  the HTTP servlet request
-     * @param response the HTTP servlet response
      */
     public void exposePublicKeyThroughEndpoint(HttpServletRequest request, HttpServletResponse response) {
         response.setHeader("Content-Type", "application/json");
@@ -119,53 +259,55 @@ public class TrustaManager {
         }
     }
 
-    /**
-     * Get a new JWT signer for the current issuer.
-     *
-     * @return a JsonWebTokenSigner instance
-     */
-    public JsonWebTokenSigner getSigner() {
-        return new JsonWebTokenSigner(this.jwtPublicKeySign, this.issuer);
+    public String getPublicKeySetAsJSONString() {
+        return publicKeySetAsJSONString;
     }
 
-    /**
-     * Load or generate the private keyset for signing JWTs.
-     *
-     * @throws GeneralSecurityException if cryptographic operations fail
-     * @throws IOException              if file operations fail
-     */
+    public int getPrimaryKeyId() {
+        return privateKeysetHandle.getPrimary().getId();
+    }
+
+    private void ensureStrategiesBound() {
+        if (!strategiesBound) {
+            bindSubjectStrategies();
+        }
+    }
+
+    private void applyKeyset(KeysetHandle handle) throws GeneralSecurityException, IOException {
+        this.privateKeysetHandle = handle;
+        this.jwtPublicKeySign = privateKeysetHandle.getPrimitive(RegistryConfiguration.get(), JwtPublicKeySign.class);
+        this.publicKeySetAsJSONString = TinkJsonProtoKeysetFormat.serializeKeyset(
+                privateKeysetHandle.getPublicKeysetHandle(),
+                InsecureSecretKeyAccess.get());
+        Files.writeString(privateKeysetPath,
+                TinkJsonProtoKeysetFormat.serializeKeyset(privateKeysetHandle, InsecureSecretKeyAccess.get()));
+    }
+
     private void handlePrivateKeysetHandle() throws GeneralSecurityException, IOException {
-        KeysetHandle privateKeysetHandle;
-        Path privateKeysetPath = Paths.get(trustaProperties.getPrivateKeysetFile());
-        // 检查私钥文件是否存在
+        KeysetHandle handle;
         if (!Files.exists(privateKeysetPath)) {
-            // 如果文件不存在，创建 JWT_ES256 密钥对
-            privateKeysetHandle = KeysetHandle.generateNew(
-                    JwtEcdsaParameters.builder()
-                            .setAlgorithm(JwtEcdsaParameters.Algorithm.ES256)
-                            .setKidStrategy(JwtEcdsaParameters.KidStrategy.IGNORED)
-                            .build());
+            handle = KeysetHandle.generateNew(jwtEcdsaParameters());
             Files.writeString(privateKeysetPath,
-                    TinkJsonProtoKeysetFormat.serializeKeyset(privateKeysetHandle,
-                            InsecureSecretKeyAccess.get()));
+                    TinkJsonProtoKeysetFormat.serializeKeyset(handle, InsecureSecretKeyAccess.get()));
         } else {
-            privateKeysetHandle = TinkJsonProtoKeysetFormat.parseKeyset(
+            handle = TinkJsonProtoKeysetFormat.parseKeyset(
                     Files.readString(privateKeysetPath),
                     InsecureSecretKeyAccess.get());
         }
-        this.jwtPublicKeySign = privateKeysetHandle.getPrimitive(RegistryConfiguration.get(),
-                JwtPublicKeySign.class);
+        this.privateKeysetHandle = handle;
+        this.jwtPublicKeySign = privateKeysetHandle.getPrimitive(RegistryConfiguration.get(), JwtPublicKeySign.class);
         this.publicKeySetAsJSONString = TinkJsonProtoKeysetFormat.serializeKeyset(
                 privateKeysetHandle.getPublicKeysetHandle(),
                 InsecureSecretKeyAccess.get());
     }
 
-    /**
-     * Register trusted issuers and initialize their verifiers.
-     * <p>
-     * This method reads the trusted issuers from the configuration, creates a JsonWebTokenVerify
-     * instance for each, and stores them in the verifyMap. It then updates the public keys for all issuers.
-     */
+    private static JwtEcdsaParameters jwtEcdsaParameters() throws GeneralSecurityException {
+        return JwtEcdsaParameters.builder()
+                .setAlgorithm(JwtEcdsaParameters.Algorithm.ES256)
+                .setKidStrategy(JwtEcdsaParameters.KidStrategy.BASE64_ENCODED_KEY_ID)
+                .build();
+    }
+
     private void registerIssuers() {
         String self = trustaProperties.getIssuer();
         boolean allowFetchPublicKeyThroughHTTP = trustaProperties.isAllowHttp();
@@ -174,13 +316,17 @@ public class TrustaManager {
             return;
         }
         for (TrustedIssuer trustedIssuer : trustedIssuers) {
-            try {
-                JsonWebTokenVerify jsonWebTokenVerify = new JsonWebTokenVerify(trustedIssuer, self, allowFetchPublicKeyThroughHTTP);
-                verifyMap.put(trustedIssuer.getIssuer(), jsonWebTokenVerify);
-            } catch (Exception e) {
-                logger.error("Error while creating verify", e);
+            if (!StringUtils.hasText(trustedIssuer.getIssuer())) {
+                throw new IllegalStateException("trusted-issuers[].issuer must not be blank");
             }
+            if (trustedIssuer.getIdentifier() == null) {
+                throw new IllegalStateException(
+                        "trusted-issuers[].identifier is required for issuer: " + trustedIssuer.getIssuer());
+            }
+            JsonWebTokenVerify jsonWebTokenVerify = new JsonWebTokenVerify(
+                    trustedIssuer, self, allowFetchPublicKeyThroughHTTP, objectMapper);
+            verifyMap.put(trustedIssuer.getIssuer(), jsonWebTokenVerify);
         }
-        updateIssuerPublicKey();
+        // Do not prefetch public keys at startup; fetch on demand by kid / first verify.
     }
 }

@@ -2,20 +2,20 @@ package cc.ddrpa.dorian.trusta;
 
 import com.google.crypto.tink.jwt.JwtPublicKeySign;
 import com.google.crypto.tink.jwt.RawJwt;
+import org.springframework.util.StringUtils;
 
 import java.security.GeneralSecurityException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Objects;
 
 /**
  * Utility for signing JSON Web Tokens (JWT) with custom claims and validity period.
+ * Audience and subject must be set explicitly before {@link #sign()}.
  */
 public class JsonWebTokenSigner {
     private static final Duration DEFAULT_VALIDITY_PERIOD = Duration.ofMinutes(3);
-    private static final String WILDCARD_AUDIENCE = "*";
 
     private final JwtPublicKeySign jwtPublicKeySign;
     private final String issuer;
@@ -48,7 +48,7 @@ public class JsonWebTokenSigner {
     }
 
     /**
-     * Set the subject for the token.
+     * Set the subject for the token. Must be the shared identifier agreed with the audience.
      *
      * @param subject the subject
      * @return this
@@ -59,7 +59,7 @@ public class JsonWebTokenSigner {
     }
 
     /**
-     * Set the audience for the token.
+     * Set the audience for the token. Required; there is no wildcard default.
      *
      * @param audience the audience
      * @return this
@@ -97,22 +97,22 @@ public class JsonWebTokenSigner {
      *
      * @return the signed JWT as a string
      * @throws GeneralSecurityException if signing fails
+     * @throws IllegalStateException    if subject or audience is missing
      */
     public String sign() throws GeneralSecurityException {
-        if (Objects.isNull(subject)) {
+        if (!StringUtils.hasText(subject)) {
             throw new IllegalStateException("Subject must be set before signing the JWT");
+        }
+        if (!StringUtils.hasText(audience)) {
+            throw new IllegalStateException("Audience must be set before signing the JWT; use issueTo(audience)");
         }
         Instant now = Instant.now();
         RawJwt.Builder rawJwtBuilder = RawJwt.newBuilder()
                 .setIssuer(issuer)
                 .setSubject(subject)
-                .setIssuedAt(Instant.now())
+                .setAudience(audience)
+                .setIssuedAt(now)
                 .setExpiration(now.plus(validityPeriod));
-        if (Objects.nonNull(audience)) {
-            rawJwtBuilder.setAudience(audience);
-        } else {
-            rawJwtBuilder.setAudience(WILDCARD_AUDIENCE);
-        }
         if (!claims.isEmpty()) {
             claims.forEach(rawJwtBuilder::addStringClaim);
         }
