@@ -10,6 +10,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.web.bind.annotation.RequestMethod;
@@ -25,7 +26,6 @@ import java.security.GeneralSecurityException;
 public class TrustaAutoConfiguration {
 
     public TrustaAutoConfiguration() throws GeneralSecurityException {
-        // Register all JWT signature key types with the Tink runtime.
         JwtSignatureConfig.register();
     }
 
@@ -36,21 +36,28 @@ public class TrustaAutoConfiguration {
     }
 
     @Bean
-    public TrustaManager trustaManager(TrustaProperties trustaProperties, ObjectMapper objectMapper) throws GeneralSecurityException, IOException {
-        return new TrustaManager(trustaProperties, objectMapper);
+    @ConditionalOnMissingBean(TrustaManager.class)
+    public TrustaManager trustaManager(TrustaProperties trustaProperties,
+                                       ObjectMapper objectMapper,
+                                       ApplicationContext applicationContext)
+            throws GeneralSecurityException, IOException {
+        return new TrustaManager(trustaProperties, objectMapper, applicationContext);
     }
 
     @Bean
     public ApplicationRunner trustaInitializationRunner(
             @Qualifier("requestMappingHandlerMapping") RequestMappingHandlerMapping handlerMapping,
             TrustaManager trustaManager) {
-        return args -> handlerMapping.registerMapping(
-                RequestMappingInfo
-                        .paths("/.well-known/trusta/jwks.json")
-                        .methods(RequestMethod.GET)
-                        .build(),
-                trustaManager,
-                new HandlerMethod(trustaManager, "exposePublicKeyThroughEndpoint", HttpServletRequest.class,
-                        HttpServletResponse.class).getMethod());
+        return args -> {
+            trustaManager.bindSubjectStrategies();
+            handlerMapping.registerMapping(
+                    RequestMappingInfo
+                            .paths(TrustaManager.JWKS_PATH)
+                            .methods(RequestMethod.GET)
+                            .build(),
+                    trustaManager,
+                    new HandlerMethod(trustaManager, "exposePublicKeyThroughEndpoint",
+                            HttpServletRequest.class, HttpServletResponse.class).getMethod());
+        };
     }
 }

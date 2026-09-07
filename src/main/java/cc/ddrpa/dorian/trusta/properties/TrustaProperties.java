@@ -14,7 +14,7 @@ public class TrustaProperties {
      */
     private String privateKeysetFile = ".jwt-es256-private-keyset";
     /**
-     * token 签发者
+     * token 签发者（同时作为本系统期望的 audience）
      */
     private String issuer = "";
     /**
