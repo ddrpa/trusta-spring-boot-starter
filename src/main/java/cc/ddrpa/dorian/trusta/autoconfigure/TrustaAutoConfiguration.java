@@ -4,8 +4,9 @@ import cc.ddrpa.dorian.trusta.TrustaManager;
 import cc.ddrpa.dorian.trusta.properties.TrustaProperties;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.crypto.tink.jwt.JwtSignatureConfig;
-import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
@@ -50,14 +51,42 @@ public class TrustaAutoConfiguration {
             TrustaManager trustaManager) {
         return args -> {
             trustaManager.bindSubjectStrategies();
+            JwksPublicEndpoint endpoint = new JwksPublicEndpoint(trustaManager);
             handlerMapping.registerMapping(
                     RequestMappingInfo
                             .paths(TrustaManager.JWKS_PATH)
                             .methods(RequestMethod.GET)
                             .build(),
-                    trustaManager,
-                    new HandlerMethod(trustaManager, "exposePublicKeyThroughEndpoint",
-                            HttpServletRequest.class, HttpServletResponse.class).getMethod());
+                    endpoint,
+                    new HandlerMethod(endpoint, "write", HttpServletResponse.class).getMethod());
         };
+    }
+
+    /**
+     * Handler backing the public JWKS endpoint ({@link TrustaManager#JWKS_PATH}, GET). It is a plain
+     * object — not a {@code @Controller} bean — created and registered programmatically by the runner,
+     * hence independent of component scanning. Only public key material is written.
+     */
+    private static final class JwksPublicEndpoint {
+
+        private static final Logger logger = LoggerFactory.getLogger(JwksPublicEndpoint.class);
+
+        private final TrustaManager trustaManager;
+
+        private JwksPublicEndpoint(TrustaManager trustaManager) {
+            this.trustaManager = trustaManager;
+        }
+
+        public void write(HttpServletResponse response) {
+            response.setHeader("Content-Type", "application/json");
+            response.setCharacterEncoding("UTF-8");
+            response.setStatus(HttpServletResponse.SC_OK);
+            try {
+                response.getWriter().write(trustaManager.getPublicKeySetAsJSONString());
+            } catch (IOException e) {
+                logger.error("Error writing public keyset to response", e);
+                response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+            }
+        }
     }
 }

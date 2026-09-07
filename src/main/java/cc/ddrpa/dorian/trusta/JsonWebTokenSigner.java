@@ -15,13 +15,20 @@ import java.util.Map;
  * Audience and subject must be set explicitly before {@link #sign()}.
  */
 public class JsonWebTokenSigner {
-    private static final Duration DEFAULT_VALIDITY_PERIOD = Duration.ofMinutes(3);
+
+    /**
+     * Upper bound for a single token's validity period. Trusta tokens are meant to be
+     * short-lived cross-system assertions (a single A→B hop); this cap prevents
+     * accidentally minting long-lived bearer credentials via configuration or call-site
+     * mistakes.
+     */
+    public static final Duration MAX_VALIDITY_PERIOD = Duration.ofMinutes(10);
 
     private final JwtPublicKeySign jwtPublicKeySign;
     private final String issuer;
     private final Map<String, String> claims = new HashMap<>();
 
-    private Duration validityPeriod = DEFAULT_VALIDITY_PERIOD;
+    private Duration validityPeriod;
     private String subject;
     private String audience;
 
@@ -30,19 +37,26 @@ public class JsonWebTokenSigner {
      *
      * @param jwtPublicKeySign the Tink JwtPublicKeySign instance
      * @param issuer           the issuer string
+     * @param defaultValidity  default validity for tokens signed through this signer
      */
-    protected JsonWebTokenSigner(JwtPublicKeySign jwtPublicKeySign, String issuer) {
+    protected JsonWebTokenSigner(JwtPublicKeySign jwtPublicKeySign, String issuer, Duration defaultValidity) {
+        if (!StringUtils.hasText(issuer)) {
+            throw new IllegalStateException("issuer must not be blank");
+        }
         this.jwtPublicKeySign = jwtPublicKeySign;
         this.issuer = issuer;
+        validateValidityPeriod(defaultValidity);
+        this.validityPeriod = defaultValidity;
     }
 
     /**
      * Set the validity period for the token.
      *
-     * @param validityPeriod the duration the token is valid
+     * @param validityPeriod the duration the token is valid; must be within (0s, {@link #MAX_VALIDITY_PERIOD}]
      * @return this
      */
     public JsonWebTokenSigner setValidityPeriod(Duration validityPeriod) {
+        validateValidityPeriod(validityPeriod);
         this.validityPeriod = validityPeriod;
         return this;
     }
@@ -117,5 +131,15 @@ public class JsonWebTokenSigner {
             claims.forEach(rawJwtBuilder::addStringClaim);
         }
         return jwtPublicKeySign.signAndEncode(rawJwtBuilder.build());
+    }
+
+    static void validateValidityPeriod(Duration validityPeriod) {
+        if (validityPeriod == null || validityPeriod.isZero() || validityPeriod.isNegative()) {
+            throw new IllegalArgumentException("validity period must be positive, got: " + validityPeriod);
+        }
+        if (validityPeriod.compareTo(MAX_VALIDITY_PERIOD) > 0) {
+            throw new IllegalArgumentException("validity period " + validityPeriod
+                    + " exceeds the maximum allowed " + MAX_VALIDITY_PERIOD);
+        }
     }
 }

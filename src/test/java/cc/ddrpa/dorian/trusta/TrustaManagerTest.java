@@ -17,13 +17,18 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.security.GeneralSecurityException;
+import java.time.Duration;
 import java.util.Base64;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -120,6 +125,25 @@ class TrustaManagerTest {
     }
 
     @Test
+    void verifiedClaimsExposeAllClaimsAsStrings() throws Exception {
+        TrustaManager issuer = issuerOnly("issuer.example.cc");
+        jwksBody.set(issuer.getPublicKeySetAsJSONString());
+        TrustaManager receiver = receiverManager("receiver-claims", "issuer.example.cc", jwksUrl);
+        String token = issuer.issueTo("audience.example.cc")
+                .setSubject("tom@example.com")
+                .addClaim("role", "admin")
+                .sign();
+        VerifiedClaims claims = receiver.verify(token);
+        assertEquals("admin", claims.getClaims().get("role"));
+        assertEquals("issuer.example.cc", claims.getClaims().get("iss"));
+        assertEquals("audience.example.cc", claims.getClaims().get("aud"));
+        assertEquals("tom@example.com", claims.getClaims().get("sub"));
+        assertTrue(claims.getClaims().containsKey("exp"));
+        assertThrows(UnsupportedOperationException.class,
+                () -> claims.getClaims().put("x", "y"));
+    }
+
+    @Test
     void rotateSigningKeyPublishesNewKidAndOldTokenStillVerifies() throws Exception {
         TrustaManager issuer = issuerOnly("issuer.example.cc");
         int oldPrimary = issuer.getPrimaryKeyId();
@@ -191,13 +215,179 @@ class TrustaManagerTest {
         assertEquals("created:new@example.com", receiver.resolve(token));
     }
 
+    @Test
+    void defaultTokenValidityIs30Seconds() throws Exception {
+        TrustaManager issuer = issuerOnly("issuer.example.cc");
+        String token = issuer.issueTo("audience.example.cc").setSubject("a@b.c").sign();
+        assertEquals(30, numericClaim(token, "exp") - numericClaim(token, "iat"));
+    }
+
+    @Test
+    void configuredTokenValidityOverridesDefault() throws Exception {
+        TrustaManager issuer = issuerOnly("issuer.example.cc",
+                props -> props.setTokenValidity(120));
+        String token = issuer.issueTo("audience.example.cc").setSubject("a@b.c").sign();
+        assertEquals(120, numericClaim(token, "exp") - numericClaim(token, "iat"));
+    }
+
+    @Test
+    void perSignerValidityOverridesDefaultAndBoundsAreEnforced() throws Exception {
+        TrustaManager issuer = issuerOnly("issuer.example.cc");
+        String token = issuer.issueTo("audience.example.cc").setSubject("a@b.c")
+                .setValidityPeriod(Duration.ofMinutes(5))
+                .sign();
+        assertEquals(300, numericClaim(token, "exp") - numericClaim(token, "iat"));
+        // zero / negative / beyond the cap are rejected
+        assertThrows(IllegalArgumentException.class, () -> issuer.issueTo("audience.example.cc")
+                .setValidityPeriod(Duration.ZERO));
+        assertThrows(IllegalArgumentException.class, () -> issuer.issueTo("audience.example.cc")
+                .setValidityPeriod(Duration.ofMinutes(-1)));
+        assertThrows(IllegalArgumentException.class, () -> issuer.issueTo("audience.example.cc")
+                .setValidityPeriod(JsonWebTokenSigner.MAX_VALIDITY_PERIOD.plusSeconds(1)));
+    }
+
+    @Test
+    void invalidConfiguredTokenValidityFailsFast() {
+        // 0 / negative / beyond the 600s cap are rejected at startup
+        assertThrows(IllegalArgumentException.class, () -> issuerOnly("issuer.example.cc",
+                props -> props.setTokenValidity(0)));
+        assertThrows(IllegalArgumentException.class, () -> issuerOnly("issuer.example.cc",
+                props -> props.setTokenValidity(-1)));
+        assertThrows(IllegalArgumentException.class, () -> issuerOnly("issuer.example.cc",
+                props -> props.setTokenValidity(601)));
+    }
+
+    @Test
+    void blankIssuerFailsFastAtStartup() {
+        TrustaProperties props = new TrustaProperties();
+        props.setIssuer("");
+        props.setPrivateKeysetFile(tempDir.resolve("blank-issuer-keyset").toString());
+        props.setTrustedIssuers(List.of());
+        StaticApplicationContext ctx = new StaticApplicationContext();
+        ctx.refresh();
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> new TrustaManager(props, objectMapper, ctx));
+        assertTrue(e.getMessage().contains("trusta.issuer"));
+    }
+
+    @Test
+    void missingKeysetIsGeneratedOnStartup() throws Exception {
+        Path keyset = tempDir.resolve("auto-created-keyset");
+        TrustaProperties props = new TrustaProperties();
+        props.setIssuer("issuer.example.cc");
+        props.setPrivateKeysetFile(keyset.toString());
+        props.setTrustedIssuers(List.of());
+        StaticApplicationContext ctx = new StaticApplicationContext();
+        ctx.refresh();
+        new TrustaManager(props, objectMapper, ctx);
+        assertTrue(Files.exists(keyset));
+    }
+
+    @Test
+    void autoGeneratedKeysetIsOwnerOnly() throws Exception {
+        Path keyset = tempDir.resolve("owner-only-keyset");
+        TrustaProperties props = new TrustaProperties();
+        props.setIssuer("issuer.example.cc");
+        props.setPrivateKeysetFile(keyset.toString());
+        props.setTrustedIssuers(List.of());
+        StaticApplicationContext ctx = new StaticApplicationContext();
+        ctx.refresh();
+        new TrustaManager(props, objectMapper, ctx);
+        assertTrue(Files.exists(keyset));
+        if (keyset.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+            assertEquals(
+                    EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE),
+                    Files.getPosixFilePermissions(keyset));
+        }
+    }
+
+    @Test
+    void unknownKidRefreshIsBackedOff() throws Exception {
+        TrustaManager issuer = issuerOnly("issuer.example.cc");
+        jwksBody.set(issuer.getPublicKeySetAsJSONString());
+        TrustaManager receiver = receiverManager("receiver-backoff", "issuer.example.cc", jwksUrl);
+        String token = issuer.issueTo("audience.example.cc").setSubject("a@b.c").sign();
+        receiver.verify(token);
+        assertEquals(1, jwksHits.get());
+
+        // First forged token with an unknown kid triggers exactly one refresh...
+        assertThrows(GeneralSecurityException.class,
+                () -> receiver.verify(forgedTokenWithKid("Zm9yZ2VkLWtpZC0x")));
+        assertEquals(2, jwksHits.get());
+        // ...but the backoff makes subsequent forged tokens fail fast without another fetch.
+        assertThrows(GeneralSecurityException.class,
+                () -> receiver.verify(forgedTokenWithKid("Zm9yZ2VkLWtpZC0y")));
+        assertEquals(2, jwksHits.get());
+    }
+
+    @Test
+    void oversizedJwtIsRejectedBeforeAnyFetch() throws Exception {
+        TrustaManager issuer = issuerOnly("issuer.example.cc");
+        jwksBody.set(issuer.getPublicKeySetAsJSONString());
+        TrustaManager receiver = receiverManager("receiver-len", "issuer.example.cc", jwksUrl);
+        String hugeHeader = base64Url("a".repeat(JsonWebTokenVerify.MAX_TOKEN_LENGTH));
+        String oversized = hugeHeader + "." + base64Url("{}") + ".c2ln";
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> receiver.verify(oversized));
+        assertTrue(e.getMessage().contains("maximum supported length"));
+        assertEquals(0, jwksHits.get());
+    }
+
+    @Test
+    void oversizedPublicKeysetContentIsRejected() throws Exception {
+        TrustaManager issuer = issuerOnly("issuer.example.cc");
+        jwksBody.set("x".repeat(JsonWebTokenVerify.MAX_PUBLIC_KEYSET_BYTES + 1));
+        TrustaManager receiver = receiverManager("receiver-huge", "issuer.example.cc", jwksUrl);
+        String token = issuer.issueTo("audience.example.cc").setSubject("a@b.c").sign();
+        assertThrows(GeneralSecurityException.class, () -> receiver.verify(token));
+        assertEquals(1, jwksHits.get());
+    }
+
+    private TrustaManager receiverManager(String keysetName, String trustedIssuer, String jwksUri)
+            throws Exception {
+        StaticApplicationContext ctx = new StaticApplicationContext();
+        ctx.registerBean(EmailStrategy.class, EmailStrategy::new);
+        ctx.refresh();
+        TrustaProperties receiverProps = new TrustaProperties();
+        receiverProps.setIssuer("audience.example.cc");
+        receiverProps.setPrivateKeysetFile(tempDir.resolve(keysetName).toString());
+        receiverProps.setAllowHttp(true);
+        receiverProps.setTrustedIssuers(List.of(new TrustedIssuer()
+                .setIssuer(trustedIssuer)
+                .setPublicKeyUri(jwksUri)
+                .setIdentifier(EmailStrategy.class)));
+        return new TrustaManager(receiverProps, objectMapper, ctx);
+    }
+
+    private static String forgedTokenWithKid(String kid) {
+        String header = "{\"alg\":\"ES256\",\"kid\":\"" + kid + "\"}";
+        String payload = "{\"iss\":\"issuer.example.cc\"}";
+        return base64Url(header) + "." + base64Url(payload) + ".c2ln";
+    }
+
+    private static String base64Url(String raw) {
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(
+                raw.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private long numericClaim(String token, String claim) throws Exception {
+        String payloadJson = new String(Base64.getUrlDecoder().decode(token.split("\\.")[1]),
+                StandardCharsets.UTF_8);
+        return objectMapper.readTree(payloadJson).get(claim).asLong();
+    }
+
     private TrustaManager issuerOnly(String issuerName) throws Exception {
+        return issuerOnly(issuerName, props -> { });
+    }
+
+    private TrustaManager issuerOnly(String issuerName, Consumer<TrustaProperties> customizer) throws Exception {
         StaticApplicationContext ctx = new StaticApplicationContext();
         ctx.refresh();
         TrustaProperties props = new TrustaProperties();
         props.setIssuer(issuerName);
         props.setPrivateKeysetFile(tempDir.resolve("issuer-" + issuerName + "-keyset").toString());
         props.setTrustedIssuers(List.of());
+        customizer.accept(props);
         return new TrustaManager(props, objectMapper, ctx);
     }
 

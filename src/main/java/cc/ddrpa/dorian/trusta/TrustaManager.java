@@ -1,17 +1,10 @@
 package cc.ddrpa.dorian.trusta;
 
+import cc.ddrpa.dorian.trusta.exceptions.SilentRegisterUnsupportedException;
 import cc.ddrpa.dorian.trusta.properties.TrustaProperties;
 import cc.ddrpa.dorian.trusta.properties.TrustedIssuer;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.crypto.tink.InsecureSecretKeyAccess;
-import com.google.crypto.tink.KeyStatus;
-import com.google.crypto.tink.KeysetHandle;
-import com.google.crypto.tink.RegistryConfiguration;
-import com.google.crypto.tink.TinkJsonProtoKeysetFormat;
-import com.google.crypto.tink.jwt.JwtEcdsaParameters;
-import com.google.crypto.tink.jwt.JwtPublicKeySign;
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.ApplicationContext;
@@ -19,10 +12,9 @@ import org.springframework.util.StringUtils;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.GeneralSecurityException;
+import java.time.Duration;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
@@ -30,60 +22,118 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * Central manager for Trusta JWT operations: signing, verification, key rotation,
- * and subject resolution via {@link SubjectStrategy}.
+ * Facade for the Trusta flow: issuing short-lived JWTs to explicit audiences, verifying tokens from
+ * trusted issuers, and resolving their subjects to local users through per-issuer
+ * {@link SubjectStrategy SubjectStrategies}.
+ * <p>
+ * The manager coordinates four collaborators — {@link JsonWebTokenVerify} (per-issuer verification
+ * and public-key caching), {@link KeysetStore} (local signing keyset lifecycle), the issuer→strategy
+ * binding and the verification registry. Public methods of the manager are thread-safe: verification
+ * is lock-free over volatile verifier state; key mutations are synchronized inside {@link KeysetStore};
+ * strategy binding is synchronized inside its registry. The public JWKS endpoint is registered by the
+ * auto-configuration (programmatic mapping), not by this class.
  */
 public class TrustaManager {
 
+    /** Well-known path (GET) at which this system publishes its public keyset. */
     public static final String JWKS_PATH = "/.well-known/trusta-jwks.json";
 
     private static final Logger logger = LoggerFactory.getLogger(TrustaManager.class);
 
     private final TrustaProperties trustaProperties;
-    private final ObjectMapper objectMapper;
-    private final ApplicationContext applicationContext;
     private final String issuer;
-    private final Path privateKeysetPath;
-
+    private final Duration defaultTokenValidity;
+    private final ObjectMapper objectMapper;
+    private final KeysetStore keysetStore;
+    private final SubjectStrategyRegistry subjectStrategyRegistry;
     private final Map<String, JsonWebTokenVerify> verifyMap = new HashMap<>();
-    private final Map<String, SubjectStrategy<?>> strategyMap = new HashMap<>();
 
-    private volatile KeysetHandle privateKeysetHandle;
-    private volatile String publicKeySetAsJSONString;
-    private volatile JwtPublicKeySign jwtPublicKeySign;
-    private volatile boolean strategiesBound;
-
+    /**
+     * Creates the manager: loads or provisions the local signing keyset, then registers the
+     * configured trusted issuers (public keys are not fetched until first verification).
+     * <p>
+     * Configuration is validated fail-fast:
+     * <ul>
+     *   <li>{@code trusta.issuer} must be non-blank;</li>
+     *   <li>{@code trusta.private-keyset-file} must be non-blank; a missing keyset file is generated
+     *       automatically on startup with owner-only permissions;</li>
+     *   <li>{@code trusta.token-validity} must be within (0, {@link JsonWebTokenSigner#MAX_VALIDITY_PERIOD}].</li>
+     * </ul>
+     *
+     * @param trustaProperties    the Trusta configuration
+     * @param objectMapper        JSON mapper used for issuer routing and claim extraction
+     * @param applicationContext  Spring context used to resolve {@link SubjectStrategy} beans
+     * @throws IllegalArgumentException if {@code token-validity} is out of range
+     * @throws IllegalStateException    if the issuer is blank, the keyset file is missing without
+     *                                  auto-generation, or its permissions are too open
+     * @throws GeneralSecurityException if the signing keyset cannot be generated or parsed
+     * @throws IOException              if the keyset file cannot be read or written
+     */
     public TrustaManager(TrustaProperties trustaProperties, ObjectMapper objectMapper,
                          ApplicationContext applicationContext) throws GeneralSecurityException, IOException {
         this.trustaProperties = trustaProperties;
-        this.objectMapper = objectMapper;
-        this.applicationContext = applicationContext;
         this.issuer = trustaProperties.getIssuer();
-        this.privateKeysetPath = Paths.get(trustaProperties.getPrivateKeysetFile());
-
-        handlePrivateKeysetHandle();
+        if (!StringUtils.hasText(this.issuer)) {
+            throw new IllegalStateException(
+                    "trusta.issuer must be set; it identifies this system as a token issuer and "
+                            + "is the audience expected when verifying inbound tokens");
+        }
+        String privateKeysetFile = trustaProperties.getPrivateKeysetFile();
+        if (!StringUtils.hasText(privateKeysetFile)) {
+            throw new IllegalStateException("trusta.private-keyset-file must not be blank");
+        }
+        long tokenValiditySeconds = trustaProperties.getTokenValidity();
+        if (tokenValiditySeconds <= 0
+                || tokenValiditySeconds > JsonWebTokenSigner.MAX_VALIDITY_PERIOD.toSeconds()) {
+            throw new IllegalArgumentException("trusta.token-validity must be within (0, "
+                    + JsonWebTokenSigner.MAX_VALIDITY_PERIOD.toSeconds() + "] seconds, got: "
+                    + tokenValiditySeconds);
+        }
+        this.defaultTokenValidity = Duration.ofSeconds(tokenValiditySeconds);
+        this.objectMapper = objectMapper;
+        this.keysetStore = new KeysetStore(Paths.get(privateKeysetFile));
+        this.subjectStrategyRegistry = new SubjectStrategyRegistry(
+                applicationContext, trustaProperties.getTrustedIssuers());
         registerIssuers();
     }
 
     /**
-     * Create a signer targeted at a specific audience. Audience is required.
+     * Creates a signer pre-bound to the given audience. This is the recommended entry point for
+     * issuing: the {@code aud} claim is mandatory (no wildcard) and will be verified by receivers
+     * against their own {@code trusta.issuer}.
+     * <p>
+     * The returned signer still requires a subject ({@code setSubject(...)}) and may set a custom
+     * validity period before {@link JsonWebTokenSigner#sign()}.
+     *
+     * @param audience the token audience ({@code aud} claim); must not be blank
+     * @return a signer builder targeting {@code audience}, with the configured default validity
+     * @throws IllegalArgumentException if {@code audience} is blank
      */
     public JsonWebTokenSigner issueTo(String audience) {
         if (!StringUtils.hasText(audience)) {
             throw new IllegalArgumentException("audience must not be blank");
         }
-        return new JsonWebTokenSigner(this.jwtPublicKeySign, this.issuer).setAudience(audience);
+        return new JsonWebTokenSigner(this.keysetStore.getSignPrimitive(), this.issuer,
+                this.defaultTokenValidity).setAudience(audience);
     }
 
     /**
-     * Get a new JWT signer for the current issuer. Audience must still be set before {@code sign()}.
+     * Creates an unbound signer for this system's issuer. The audience must still be set explicitly
+     * before signing — prefer {@link #issueTo(String)} to avoid forgetting it.
+     *
+     * @return a signer builder with no audience set, using the configured default validity
      */
     public JsonWebTokenSigner getSigner() {
-        return new JsonWebTokenSigner(this.jwtPublicKeySign, this.issuer);
+        return new JsonWebTokenSigner(this.keysetStore.getSignPrimitive(), this.issuer,
+                this.defaultTokenValidity);
     }
 
     /**
-     * Manually refresh cached public keys for all trusted issuers.
+     * Manually refreshes the cached public keys for every trusted issuer (e.g. from a scheduler after
+     * key rotation). Per-issuer failures are logged and do not abort the remaining issuers; issuers
+     * that were already ready keep their previous keyset when a refresh fails.
+     * <p>
+     * Manual refreshes bypass the on-demand refresh backoff used during verification.
      */
     public void updateIssuerPublicKey() {
         logger.info("Updating issuer public keys");
@@ -105,30 +155,65 @@ public class TrustaManager {
     }
 
     /**
-     * Verify and parse a JWT from a trusted issuer.
+     * Verifies a signed JWT from a configured trusted issuer: signature, {@code iss} and {@code aud}
+     * (this system's own issuer), and expiration are validated cryptographically via Tink. The issuer
+     * is routed by the (untrusted) {@code iss} claim, then re-checked against the issuer's keyset.
+     * <p>
+     * Public keys are cached and fetched on demand (see {@link JsonWebTokenVerify}); the returned
+     * {@link VerifiedClaims} exposes {@code iss}, {@code sub} and the full payload as an unmodifiable
+     * string-valued {@code claims} map.
+     *
+     * @param signedToken the JWT to verify
+     * @return verified claims (issuer, subject, and all payload claims as strings)
+     * @throws IllegalArgumentException  if the token exceeds {@link JsonWebTokenVerify#MAX_TOKEN_LENGTH}
+     *                                   characters or is not a well-formed three-part JWT
+     * @throws GeneralSecurityException if the issuer is not trusted, the signature is invalid, the
+     *                                   token is expired, or the public keyset cannot be fetched
+     * @throws IOException              if the JWT payload cannot be decoded as JSON
      */
     public VerifiedClaims verify(String signedToken) throws GeneralSecurityException, IOException {
+        if (signedToken.length() > JsonWebTokenVerify.MAX_TOKEN_LENGTH) {
+            throw new IllegalArgumentException("JWT exceeds the maximum supported length of "
+                    + JsonWebTokenVerify.MAX_TOKEN_LENGTH + " characters");
+        }
         String[] parts = signedToken.split("\\.");
         if (parts.length != 3) {
             throw new IllegalArgumentException("Invalid JWT format");
         }
         String payloadJson = new String(Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8);
-        String claimedIssuer = objectMapper.readTree(payloadJson).path("iss").asText();
+        JsonNode payloadNode = objectMapper.readTree(payloadJson);
+        String claimedIssuer = payloadNode.path("iss").asText();
         JsonWebTokenVerify verifier = verifyMap.get(claimedIssuer);
         if (verifier == null) {
             throw new GeneralSecurityException("Unknown issuer: " + claimedIssuer);
         }
-        return verifier.verify(signedToken).setRawPayload(payloadJson);
+        return verifier.verify(signedToken)
+                .setClaims(JsonWebTokenVerify.toStringClaimsMap(payloadNode));
     }
 
     /**
-     * Verify a token and resolve it to a local user through the issuer's {@link SubjectStrategy}.
+     * Verifies a token (see {@link #verify(String)}) and resolves its subject to a local user
+     * through the {@link SubjectStrategy} bound to the token's issuer: {@link SubjectStrategy#find}
+     * first, and — if no user is found — {@link SubjectStrategy#register} (silent registration).
+     * <p>
+     * Strategies are bound lazily on first call if they have not been bound yet (see
+     * {@link #bindSubjectStrategies()}). Call this only at entry points that should accept a
+     * Trusta token (e.g. a login handoff endpoint), not as a per-request credential check.
+     *
+     * @param signedToken the JWT to verify and resolve
+     * @param <T>         the local user type produced by the {@link SubjectStrategy}
+     * @return the local user found or silently registered for the token's subject
+     * @throws IllegalArgumentException   if the token is malformed or exceeds the length limit
+     * @throws GeneralSecurityException   if the token fails cryptographic verification
+     * @throws IOException                if the token payload cannot be decoded
+     * @throws IllegalStateException      if no strategy is bound for the token's issuer
+     * @throws SilentRegisterUnsupportedException if no user exists and the strategy does not
+     *                                    implement {@link SubjectStrategy#register}
      */
     @SuppressWarnings("unchecked")
     public <T> T resolve(String signedToken) throws GeneralSecurityException, IOException {
-        ensureStrategiesBound();
         VerifiedClaims claims = verify(signedToken);
-        SubjectStrategy<T> strategy = (SubjectStrategy<T>) strategyMap.get(claims.getIssuer());
+        SubjectStrategy<T> strategy = (SubjectStrategy<T>) subjectStrategyRegistry.get(claims.getIssuer());
         if (strategy == null) {
             throw new IllegalStateException("No SubjectStrategy bound for issuer: " + claims.getIssuer());
         }
@@ -137,175 +222,83 @@ public class TrustaManager {
     }
 
     /**
-     * Bind {@link SubjectStrategy} beans declared by {@code trusted-issuers[].identifier}.
-     * Must run after the application context has finished creating user beans.
+     * Binds a {@link SubjectStrategy} bean to each trusted issuer, using the {@code identifier}
+     * declared in {@code trusta.trusted-issuers}. Issuers sharing the same {@code identifier}
+     * class share the same bean instance.
+     * <p>
+     * Called automatically by the auto-configuration after the application context is ready, and
+     * lazily by {@link #resolve(String)} if needed. Idempotent; safe to call more than once.
+     *
+     * @throws IllegalStateException if a trusted issuer is missing its {@code identifier}, the
+     *                               class does not implement {@link SubjectStrategy}, or no such
+     *                               Spring bean exists
      */
     public synchronized void bindSubjectStrategies() {
-        if (strategiesBound) {
-            return;
-        }
-        Map<Class<?>, SubjectStrategy<?>> beanByClass = new HashMap<>();
-        for (TrustedIssuer trustedIssuer : trustaProperties.getTrustedIssuers()) {
-            Class<? extends SubjectStrategy> identifier = trustedIssuer.getIdentifier();
-            if (identifier == null) {
-                throw new IllegalStateException(
-                        "trusted-issuers[].identifier is required for issuer: " + trustedIssuer.getIssuer());
-            }
-            if (!SubjectStrategy.class.isAssignableFrom(identifier)) {
-                throw new IllegalStateException(
-                        "identifier must implement SubjectStrategy for issuer: " + trustedIssuer.getIssuer()
-                                + ", got: " + identifier.getName());
-            }
-            SubjectStrategy<?> strategy = beanByClass.get(identifier);
-            if (strategy == null) {
-                try {
-                    strategy = applicationContext.getBean(identifier);
-                } catch (Exception e) {
-                    throw new IllegalStateException(
-                            "No Spring bean of type " + identifier.getName()
-                                    + " for issuer " + trustedIssuer.getIssuer()
-                                    + ". Register it with @Component or @Bean.", e);
-                }
-                beanByClass.put(identifier, strategy);
-            }
-            strategyMap.put(trustedIssuer.getIssuer(), strategy);
-        }
-        strategiesBound = true;
-        logger.info("Bound {} subject strategies for {} trusted issuers",
-                beanByClass.size(), strategyMap.size());
+        subjectStrategyRegistry.bindAll();
     }
 
     /**
-     * Rotate the signing key: add a new ES256 primary key with kid, persist, refresh JWKS.
+     * Adds a new ES256 primary key with a fresh {@code kid}, persists the updated keyset atomically
+     * and refreshes the published public keyset. Other enabled keys stay enabled, so receivers can
+     * still verify tokens signed before the rotation until those keys are disabled (see
+     * {@link #disableNonPrimaryKeys()} after a grace period ≥ token validity).
      *
-     * @return the new primary key id
+     * @return the Tink key id of the new primary signing key
+     * @throws GeneralSecurityException if key generation fails
+     * @throws IOException              if the updated keyset cannot be persisted (e.g. read-only mount);
+     *                                  on failure the running keyset is left unchanged
      */
-    public synchronized int rotateSigningKey() throws GeneralSecurityException, IOException {
-        JwtEcdsaParameters parameters = jwtEcdsaParameters();
-        KeysetHandle.Builder builder = KeysetHandle.newBuilder(privateKeysetHandle);
-        builder.addEntry(KeysetHandle.generateEntryFromParameters(parameters).withRandomId().makePrimary());
-        applyKeyset(builder.build());
-        int primaryId = privateKeysetHandle.getPrimary().getId();
-        logger.info("Rotated signing key, new primary key id={}", primaryId);
-        return primaryId;
+    public int rotateSigningKey() throws GeneralSecurityException, IOException {
+        return keysetStore.rotateSigningKey();
     }
 
     /**
-     * Disable a non-primary signing key by Tink key id.
+     * Disables a non-primary signing key by its Tink key id and persists the change. Tokens signed
+     * with the disabled key stop verifying on receivers once they refresh their cached keyset
+     * (within the receiver cache TTL).
+     *
+     * @param keyId the Tink key id of the key to disable (see {@link #getPrimaryKeyId()} for the
+     *              current primary; other ids can be listed via the persisted keyset)
+     * @throws IllegalArgumentException  if {@code keyId} is the primary key or unknown
+     * @throws GeneralSecurityException if rebuilding the keyset fails
+     * @throws IOException              if the updated keyset cannot be persisted; on failure the
+     *                                  running keyset is left unchanged
      */
-    public synchronized void disableSigningKey(int keyId) throws GeneralSecurityException, IOException {
-        if (privateKeysetHandle.getPrimary().getId() == keyId) {
-            throw new IllegalArgumentException("Cannot disable the primary signing key id=" + keyId);
-        }
-        KeysetHandle.Builder fresh = KeysetHandle.newBuilder();
-        boolean found = false;
-        for (int i = 0; i < privateKeysetHandle.size(); i++) {
-            KeysetHandle.Entry entry = privateKeysetHandle.getAt(i);
-            KeysetHandle.Builder.Entry imported = KeysetHandle.importKey(entry.getKey()).withFixedId(entry.getId());
-            if (entry.getId() == keyId) {
-                imported.setStatus(KeyStatus.DISABLED);
-                found = true;
-            } else {
-                imported.setStatus(entry.getStatus());
-            }
-            if (entry.isPrimary()) {
-                imported.makePrimary();
-            }
-            fresh.addEntry(imported);
-        }
-        if (!found) {
-            throw new IllegalArgumentException("Unknown signing key id=" + keyId);
-        }
-        applyKeyset(fresh.build());
-        logger.info("Disabled signing key id={}", keyId);
+    public void disableSigningKey(int keyId) throws GeneralSecurityException, IOException {
+        keysetStore.disableSigningKey(keyId);
     }
 
     /**
-     * Disable all non-primary keys after a rotation grace period.
+     * Disables every enabled non-primary signing key, leaving only the current primary enabled.
+     * Intended for the cleanup step after a rotation grace period (≥ token validity): the disabled
+     * keys leave the published keyset, and receivers reject tokens signed with them after their next
+     * refresh.
+     *
+     * @throws GeneralSecurityException if rebuilding the keyset fails
+     * @throws IOException              if the updated keyset cannot be persisted; on failure the
+     *                                  running keyset is left unchanged
      */
-    public synchronized void disableNonPrimaryKeys() throws GeneralSecurityException, IOException {
-        int primaryId = privateKeysetHandle.getPrimary().getId();
-        KeysetHandle.Builder fresh = KeysetHandle.newBuilder();
-        int disabled = 0;
-        for (int i = 0; i < privateKeysetHandle.size(); i++) {
-            KeysetHandle.Entry entry = privateKeysetHandle.getAt(i);
-            KeysetHandle.Builder.Entry imported = KeysetHandle.importKey(entry.getKey()).withFixedId(entry.getId());
-            if (entry.getId() == primaryId) {
-                imported.setStatus(KeyStatus.ENABLED).makePrimary();
-            } else if (entry.getStatus() == KeyStatus.ENABLED) {
-                imported.setStatus(KeyStatus.DISABLED);
-                disabled++;
-            } else {
-                imported.setStatus(entry.getStatus());
-            }
-            fresh.addEntry(imported);
-        }
-        applyKeyset(fresh.build());
-        logger.info("Disabled {} non-primary signing keys; primary id={}", disabled, primaryId);
+    public void disableNonPrimaryKeys() throws GeneralSecurityException, IOException {
+        keysetStore.disableNonPrimaryKeys();
     }
 
     /**
-     * Expose the public key set as a JSON response through an HTTP endpoint.
+     * Returns the JSON of this system's public keyset, as published on {@link #JWKS_PATH} and used
+     * by other systems to verify tokens issued here. Contains public key material only.
+     *
+     * @return the serialized public keyset JSON
      */
-    public void exposePublicKeyThroughEndpoint(HttpServletRequest request, HttpServletResponse response) {
-        response.setHeader("Content-Type", "application/json");
-        response.setCharacterEncoding("UTF-8");
-        response.setStatus(HttpServletResponse.SC_OK);
-        try {
-            response.getWriter().write(publicKeySetAsJSONString);
-        } catch (IOException e) {
-            logger.error("Error writing public keyset to response", e);
-            response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
-        }
-    }
-
     public String getPublicKeySetAsJSONString() {
-        return publicKeySetAsJSONString;
+        return keysetStore.getPublicKeysetJson();
     }
 
+    /**
+     * Returns the Tink key id of the current primary signing key (the key used to sign new tokens).
+     *
+     * @return the primary signing key's Tink id
+     */
     public int getPrimaryKeyId() {
-        return privateKeysetHandle.getPrimary().getId();
-    }
-
-    private void ensureStrategiesBound() {
-        if (!strategiesBound) {
-            bindSubjectStrategies();
-        }
-    }
-
-    private void applyKeyset(KeysetHandle handle) throws GeneralSecurityException, IOException {
-        this.privateKeysetHandle = handle;
-        this.jwtPublicKeySign = privateKeysetHandle.getPrimitive(RegistryConfiguration.get(), JwtPublicKeySign.class);
-        this.publicKeySetAsJSONString = TinkJsonProtoKeysetFormat.serializeKeyset(
-                privateKeysetHandle.getPublicKeysetHandle(),
-                InsecureSecretKeyAccess.get());
-        Files.writeString(privateKeysetPath,
-                TinkJsonProtoKeysetFormat.serializeKeyset(privateKeysetHandle, InsecureSecretKeyAccess.get()));
-    }
-
-    private void handlePrivateKeysetHandle() throws GeneralSecurityException, IOException {
-        KeysetHandle handle;
-        if (!Files.exists(privateKeysetPath)) {
-            handle = KeysetHandle.generateNew(jwtEcdsaParameters());
-            Files.writeString(privateKeysetPath,
-                    TinkJsonProtoKeysetFormat.serializeKeyset(handle, InsecureSecretKeyAccess.get()));
-        } else {
-            handle = TinkJsonProtoKeysetFormat.parseKeyset(
-                    Files.readString(privateKeysetPath),
-                    InsecureSecretKeyAccess.get());
-        }
-        this.privateKeysetHandle = handle;
-        this.jwtPublicKeySign = privateKeysetHandle.getPrimitive(RegistryConfiguration.get(), JwtPublicKeySign.class);
-        this.publicKeySetAsJSONString = TinkJsonProtoKeysetFormat.serializeKeyset(
-                privateKeysetHandle.getPublicKeysetHandle(),
-                InsecureSecretKeyAccess.get());
-    }
-
-    private static JwtEcdsaParameters jwtEcdsaParameters() throws GeneralSecurityException {
-        return JwtEcdsaParameters.builder()
-                .setAlgorithm(JwtEcdsaParameters.Algorithm.ES256)
-                .setKidStrategy(JwtEcdsaParameters.KidStrategy.BASE64_ENCODED_KEY_ID)
-                .build();
+        return keysetStore.getPrimaryKeyId();
     }
 
     private void registerIssuers() {

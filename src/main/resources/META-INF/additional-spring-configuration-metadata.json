@@ -11,7 +11,7 @@
       "name": "trusta.private-keyset-file",
       "type": "java.lang.String",
       "description": "私钥文件位置，用于签发 JWT",
-      "defaultValue": ".jwt-es256-private-keyset"
+      "defaultValue": "trusta-jwt-es256-private-keyset"
     },
     {
       "name": "trusta.issuer",
@@ -44,6 +44,12 @@
       "name": "trusta.trusted-issuers[].identifier",
       "type": "java.lang.Class",
       "description": "SubjectStrategy 实现类；多个 issuer 可指向同一 Class 以复用用户匹配与静默注册逻辑"
+    },
+    {
+      "name": "trusta.token-validity",
+      "type": "java.lang.Long",
+      "description": "签发令牌的默认有效期（秒）。跨系统跳转令牌应保持短生命周期；上限 600 秒，单次签发可用 JsonWebTokenSigner.setValidityPeriod 覆盖",
+      "defaultValue": 30
     }
   ]
 }

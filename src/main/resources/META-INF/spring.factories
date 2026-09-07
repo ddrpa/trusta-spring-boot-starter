@@ -1,1 +1,1 @@
-org.springframework.boot.autoconfigure.EnableAutoConfiguration=autoconfigure.cc.ddrpa.dorian.trusta.TrustaAutoConfiguration
+org.springframework.boot.autoconfigure.EnableAutoConfiguration=cc.ddrpa.dorian.trusta.autoconfigure.TrustaAutoConfiguration

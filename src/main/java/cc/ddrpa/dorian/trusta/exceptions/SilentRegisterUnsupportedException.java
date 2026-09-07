@@ -1,4 +1,6 @@
-package cc.ddrpa.dorian.trusta;
+package cc.ddrpa.dorian.trusta.exceptions;
+
+import cc.ddrpa.dorian.trusta.SubjectStrategy;
 
 /**
  * Thrown when a {@link SubjectStrategy} does not support silent registration

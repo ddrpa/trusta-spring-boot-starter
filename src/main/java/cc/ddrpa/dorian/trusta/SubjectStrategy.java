@@ -1,5 +1,7 @@
 package cc.ddrpa.dorian.trusta;
 
+import cc.ddrpa.dorian.trusta.exceptions.SilentRegisterUnsupportedException;
+
 import java.util.Optional;
 
 /**

@@ -1,5 +1,8 @@
 package cc.ddrpa.dorian.trusta;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -15,9 +18,13 @@ public class VerifiedClaims {
      */
     private String subject;
     /**
-     * The raw payload of the JWT.
+     * All claims of the verified token payload as a string-valued map (unmodifiable).
+     * <p>
+     * String claims are returned as-is; numbers, booleans, arrays and objects are returned as
+     * their compact JSON text; {@code null} claims are kept as {@code null}. {@code iss}/{@code sub}
+     * are duplicated here and are also available via {@link #getIssuer()} / {@link #getSubject()}.
      */
-    private String rawPayload;
+    private Map<String, String> claims = Collections.emptyMap();
 
     public String getIssuer() {
         return issuer;
@@ -37,12 +44,14 @@ public class VerifiedClaims {
         return this;
     }
 
-    public String getRawPayload() {
-        return rawPayload;
+    public Map<String, String> getClaims() {
+        return claims;
     }
 
-    public VerifiedClaims setRawPayload(String rawPayload) {
-        this.rawPayload = rawPayload;
+    public VerifiedClaims setClaims(Map<String, String> claims) {
+        this.claims = claims == null || claims.isEmpty()
+                ? Collections.emptyMap()
+                : Collections.unmodifiableMap(new LinkedHashMap<>(claims));
         return this;
     }
 
@@ -53,12 +62,12 @@ public class VerifiedClaims {
         VerifiedClaims that = (VerifiedClaims) o;
         return Objects.equals(issuer, that.issuer) &&
                 Objects.equals(subject, that.subject) &&
-                Objects.equals(rawPayload, that.rawPayload);
+                Objects.equals(claims, that.claims);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(issuer, subject, rawPayload);
+        return Objects.hash(issuer, subject, claims);
     }
 
     @Override
@@ -66,7 +75,7 @@ public class VerifiedClaims {
         return "VerifiedClaims{" +
                 "issuer='" + issuer + '\'' +
                 ", subject='" + subject + '\'' +
-                ", rawPayload='" + rawPayload + '\'' +
+                ", claims=" + claims +
                 '}';
     }
 }

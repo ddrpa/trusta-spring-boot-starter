@@ -27,6 +27,9 @@ import java.time.Instant;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -42,6 +45,20 @@ public class JsonWebTokenVerify {
     private static final Logger logger = LoggerFactory.getLogger(JsonWebTokenVerify.class);
     static final Duration DEFAULT_PUBLIC_KEY_CACHE_TTL = Duration.ofMinutes(3);
     private static final String DEFAULT_JWKS_PATH = "/.well-known/trusta-jwks.json";
+    /**
+     * After a refresh that failed to authenticate an unknown {@code kid} (or failed to fetch at all),
+     * further unknown-kid/cold verifications fail fast without another refresh for this long.
+     * This bounds the per-token refresh amplification; manual {@link #updatePublicKey()} always
+     * bypasses the backoff.
+     */
+    static final Duration REFRESH_BACKOFF = Duration.ofSeconds(30);
+    /**
+     * Upper bound for the public keyset content accepted for parsing, regardless of how the content
+     * was obtained (network fetch, injected string, ...). 256 KiB is far above any realistic keyset.
+     */
+    public static final int MAX_PUBLIC_KEYSET_BYTES = 256 * 1024;
+    /** Upper bound for a JWT passed into verification paths (defense in depth against oversized input). */
+    public static final int MAX_TOKEN_LENGTH = 16 * 1024;
 
     private final String issuer;
     private final URI publicKeyURI;
@@ -55,6 +72,7 @@ public class JsonWebTokenVerify {
     private volatile Set<String> knownKids = Collections.emptySet();
     private volatile Instant cacheExpiresAt = Instant.EPOCH;
     private volatile Instant lastUpdateTime;
+    private volatile Instant refreshBackoffUntil = Instant.EPOCH;
     private volatile CompletableFuture<Void> inFlightRefresh;
 
     /**
@@ -111,6 +129,10 @@ public class JsonWebTokenVerify {
      * Verify and decode a JWT from this issuer.
      */
     public VerifiedClaims verify(final String signedToken) throws GeneralSecurityException {
+        if (signedToken.length() > MAX_TOKEN_LENGTH) {
+            throw new IllegalArgumentException("JWT exceeds the maximum supported length of "
+                    + MAX_TOKEN_LENGTH + " characters");
+        }
         ensurePublicKey(signedToken);
         JwtPublicKeyVerify verifier = this.jwtPublicKeyVerify;
         if (verifier == null) {
@@ -120,13 +142,21 @@ public class JsonWebTokenVerify {
             return decode(verifier, signedToken);
         } catch (GeneralSecurityException firstFailure) {
             String kid = extractKid(signedToken);
-            if (kid != null && !knownKids.contains(kid)) {
+            if (kid != null && !knownKids.contains(kid)
+                    && !Instant.now().isBefore(refreshBackoffUntil)) {
+                // Unknown kid: at most one refresh per backoff window, then decode again.
                 forceRefresh();
                 verifier = this.jwtPublicKeyVerify;
                 if (verifier == null) {
                     throw firstFailure;
                 }
-                return decode(verifier, signedToken);
+                try {
+                    return decode(verifier, signedToken);
+                } catch (GeneralSecurityException secondFailure) {
+                    // Fresh keyset still lacks this kid: keep the backoff active.
+                    markRefreshBackoff();
+                    throw secondFailure;
+                }
             }
             throw firstFailure;
         }
@@ -154,7 +184,28 @@ public class JsonWebTokenVerify {
                 && (kid == null || knownKids.contains(kid))) {
             return;
         }
-        forceRefresh();
+        if (jwtPublicKeyVerify == null) {
+            // Cold start: always try once, but do not hammer a down issuer more than once per backoff.
+            if (now.isBefore(refreshBackoffUntil)) {
+                throw new GeneralSecurityException("Public key is not ready for issuer: " + issuer
+                        + " (previous refresh attempt failed; next attempt allowed after "
+                        + refreshBackoffUntil + ")");
+            }
+            forceRefresh();
+            return;
+        }
+        // Cache expired: refresh when not currently backing off. Unknown kids are not refreshed
+        // here; verify() performs the single refresh per backoff window, so a forged token triggers
+        // at most one fetch per call.
+        if (!now.isBefore(cacheExpiresAt)
+                && (kid == null || knownKids.contains(kid))
+                && !now.isBefore(refreshBackoffUntil)) {
+            forceRefresh();
+        }
+    }
+
+    private void markRefreshBackoff() {
+        refreshBackoffUntil = Instant.now().plus(REFRESH_BACKOFF);
     }
 
     private void forceRefresh() throws GeneralSecurityException {
@@ -184,6 +235,7 @@ public class JsonWebTokenVerify {
             refresh.join();
         } catch (CompletionException e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
+            markRefreshBackoff();
             if (jwtPublicKeyVerify != null) {
                 logger.warn("Failed to refresh public key for issuer {}, keeping cached keyset: {}",
                         issuer, cause.getMessage());
@@ -215,6 +267,10 @@ public class JsonWebTokenVerify {
                     + ", status code: " + response.statusCode());
         }
         String publicKeysetAsString = response.body();
+        if (publicKeysetAsString.length() > MAX_PUBLIC_KEYSET_BYTES) {
+            throw new IOException("Public keyset content from " + publicKeyURI + " exceeds the maximum "
+                    + "allowed size of " + MAX_PUBLIC_KEYSET_BYTES + " bytes");
+        }
         KeysetHandle publicKeysetHandle = TinkJsonProtoKeysetFormat.parseKeyset(
                 publicKeysetAsString, InsecureSecretKeyAccess.get());
         JwtPublicKeyVerify verify = publicKeysetHandle.getPrimitive(
@@ -225,6 +281,7 @@ public class JsonWebTokenVerify {
             this.knownKids = kids;
             this.lastUpdateTime = Instant.now();
             this.cacheExpiresAt = this.lastUpdateTime.plus(cacheTtl);
+            this.refreshBackoffUntil = Instant.EPOCH;
         }
     }
 
@@ -237,6 +294,26 @@ public class JsonWebTokenVerify {
             }
         }
         return Collections.unmodifiableSet(kids);
+    }
+
+    /**
+     * All payload claims as a string-valued map: strings stay as-is; numbers, booleans, arrays and
+     * objects become their compact JSON text; {@code null} stays {@code null}.
+     */
+    static Map<String, String> toStringClaimsMap(JsonNode payloadNode) {
+        Map<String, String> claims = new LinkedHashMap<>();
+        for (Iterator<Map.Entry<String, JsonNode>> fields = payloadNode.fields(); fields.hasNext(); ) {
+            Map.Entry<String, JsonNode> field = fields.next();
+            JsonNode value = field.getValue();
+            if (value.isNull()) {
+                claims.put(field.getKey(), null);
+            } else if (value.isTextual()) {
+                claims.put(field.getKey(), value.asText());
+            } else {
+                claims.put(field.getKey(), value.toString());
+            }
+        }
+        return claims;
     }
 
     static String base64UrlKid(int keyId) {
